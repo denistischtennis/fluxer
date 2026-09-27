@@ -167,3 +167,26 @@ test('a bad commit after processing proposals flags invalid_commit_welcome', () 
 	c.destroy();
 	peer.destroy();
 });
+
+test('refound via prepare_epoch re-uploads key package without a new sender event', () => {
+	const t = new RecordingTransport();
+	const a = new DaveClient({mod, selfUserId: USER_A, channelId: GROUP, transport: t, tofu: new TofuStore(new MemStorage())});
+	a.onEvent({type: 'select_protocol_ack', version: 1});
+	// No sender installed yet -> founding upload deferred, nothing sent.
+	expect(t.sent.filter((m) => m.type === 'key_package').length).toBe(0);
+	const delivery = new mod.DaveDelivery();
+	const gen = delivery.GenerateExternalSender(Array.from({length: 32}, (_, i) => (i * 7 + 3) & 0xff));
+	a.onEvent({type: 'external_sender_package', data: b64(gen.senderPackage as number[])});
+	const firstKp = t.sent.filter((m) => m.type === 'key_package');
+	expect(firstKp.length).toBe(1);
+	expect((firstKp[0].data ?? '').length).toBeGreaterThan(200);
+	// Simulate the coordinator's single-member-reset / invalid-commit re-found:
+	// a bare prepare_epoch(1) must immediately produce a fresh key package by
+	// reinstalling the known DS sender into the re-initialized session.
+	a.onEvent({type: 'prepare_epoch', epoch: 1, version: 1});
+	const ups = t.sent.filter((m) => m.type === 'key_package');
+	expect(ups.length).toBe(2);
+	expect(ups[1].data).not.toBe(ups[0].data);
+	expect(a.status).not.toBe('broken');
+	a.destroy();
+});

@@ -84,6 +84,14 @@ export class DaveClient {
 	 */
 	private externalSenderSet = false;
 	private pendingKeyPackage = false;
+	/**
+	 * Last externally supplied DS sender package (already TOFU-verified on
+	 * arrival). prepare_epoch re-founds a session WITHOUT a fresh
+	 * external_sender_package event, so the known bytes are re-installed
+	 * into the new session to let the founding key package marshal right
+	 * away instead of pending forever.
+	 */
+	private externalSenderB64: string | null = null;
 	private destroyed = false;
 
 	constructor(params: CreateDaveClientParams) {
@@ -228,6 +236,7 @@ export class DaveClient {
 			);
 		}
 		this.session.SetExternalSender(bytes);
+		this.externalSenderB64 = dataB64;
 		this.externalSenderSet = true;
 		if (this.pendingKeyPackage || this.established) {
 			// Fresh DS package: (re-)upload our KP so future joins can add us.
@@ -316,6 +325,12 @@ export class DaveClient {
 			this.session.Init(protocolVersion, BigInt(this.channelId), this.selfUserId, privateKey);
 			this.externalSenderSet = false;
 			this.pendingKeyPackage = false;
+			if (this.externalSenderB64 !== null) {
+				// Re-arm the deferred-key-package path: the DS sender is
+				// deployment-wide, so reuse the previously verified copy.
+				this.session.SetExternalSender(decodeBytes(this.externalSenderB64));
+				this.externalSenderSet = true;
+			}
 		}
 	}
 
