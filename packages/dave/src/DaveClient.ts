@@ -98,6 +98,14 @@ export class DaveClient {
 	 * participant delivery). recognizeUser() retries automatically.
 	 */
 	private deferredProposalsB64: string | null = null;
+	/**
+	 * Exact bytes of the last proposals bundle fully processed in this session
+	 * generation. The gateway can deliver the same DS-signed bundle more than
+	 * once (live event racing the deferred retry); re-processing it makes
+	 * libdave abort with 'Duplicate encryption key'. A bundle is immutable
+	 * signed DS output, so identical bytes mean "already handled".
+	 */
+	private lastProcessedProposalsB64: string | null = null;
 	private processingProposals = false;
 	private deferredProposalReason = '';
 	private destroyed = false;
@@ -263,6 +271,10 @@ export class DaveClient {
 	}
 
 	private handleProposals(proposalsB64: string): void {
+		if (proposalsB64 === this.lastProcessedProposalsB64) {
+			console.info('[dave] ignoring duplicate proposals bundle already processed', {channelId: this.channelId});
+			return;
+		}
 		this.processingProposals = true;
 		this.deferredProposalReason = '';
 		let commitWelcome: unknown;
@@ -279,6 +291,7 @@ export class DaveClient {
 			return;
 		}
 		this.deferredProposalsB64 = null;
+		this.lastProcessedProposalsB64 = proposalsB64;
 		if (commitWelcome) {
 			this.send({type: 'commit_welcome', data: encodeBytes(commitWelcome as number[])});
 		}
@@ -367,6 +380,7 @@ export class DaveClient {
 			this.session.Init(protocolVersion, BigInt(this.channelId), this.selfUserId, privateKey);
 			this.externalSenderSet = false;
 			this.pendingKeyPackage = false;
+			this.lastProcessedProposalsB64 = null;
 			if (this.externalSenderB64 !== null) {
 				// Re-arm the deferred-key-package path: the DS sender is
 				// deployment-wide, so reuse the previously verified copy.

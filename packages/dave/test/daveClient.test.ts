@@ -219,3 +219,26 @@ test('proposals for an unrecognized user defer and commit on recognition', () =>
 	a.destroy();
 	b.destroy();
 });
+
+test('duplicate deliveries of the same proposals bundle are processed once', async () => {
+	const delivery = new mod.DaveDelivery();
+	const gen = delivery.GenerateExternalSender(Array.from({length: 32}, (_, i) => (i * 7 + 3) & 0xff));
+	const senderB64 = b64(gen.senderPackage as number[]);
+	const tb = new RecordingTransport();
+	const b = new DaveClient({mod, selfUserId: USER_B, channelId: GROUP, transport: tb, tofu: new TofuStore(new MemStorage())});
+	b.onEvent({type: 'select_protocol_ack', version: 1});
+	b.onEvent({type: 'external_sender_package', data: senderB64});
+	const bundle = b64(delivery.CreateProposals(GROUP, 0, [unb64(tb.last('key_package')!.data as string)], []) as number[]);
+	const ta = new RecordingTransport();
+	const a = new DaveClient({mod, selfUserId: USER_A, channelId: GROUP, transport: ta, tofu: new TofuStore(new MemStorage())});
+	a.onEvent({type: 'select_protocol_ack', version: 1});
+	a.onEvent({type: 'external_sender_package', data: senderB64});
+	a.recognizeUser(USER_B);
+	a.onEvent({type: 'proposals', data: bundle});
+	a.onEvent({type: 'proposals', data: bundle});
+	a.onEvent({type: 'proposals', data: bundle});
+	expect(ta.sent.filter((m) => m.type === 'commit_welcome').length).toBe(1);
+	expect(a.status).not.toBe('broken');
+	a.destroy();
+	b.destroy();
+});
