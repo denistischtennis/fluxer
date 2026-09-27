@@ -76,6 +76,14 @@ export class DaveClient {
 	private established = false;
 	private disabledByTofu = false;
 	private mlsFailed = false;
+	/**
+	 * libdave cannot marshal a KeyPackage until the DS external sender is
+	 * installed ("waiting for external sender"). The gateway fires
+	 * select_protocol_ack before external_sender_package, so defer the upload
+	 * instead of sending an empty KP.
+	 */
+	private externalSenderSet = false;
+	private pendingKeyPackage = false;
 	private destroyed = false;
 
 	constructor(params: CreateDaveClientParams) {
@@ -220,6 +228,11 @@ export class DaveClient {
 			);
 		}
 		this.session.SetExternalSender(bytes);
+		this.externalSenderSet = true;
+		if (this.pendingKeyPackage || this.established) {
+			// Fresh DS package: (re-)upload our KP so future joins can add us.
+			this.sendKeyPackage();
+		}
 	}
 
 	private handleProposals(proposalsB64: string): void {
@@ -262,7 +275,16 @@ export class DaveClient {
 	}
 
 	private sendKeyPackage(): void {
+		if (!this.externalSenderSet) {
+			this.pendingKeyPackage = true;
+			return;
+		}
 		const kp = this.session.GetMarshalledKeyPackage();
+		if (!kp || (kp as number[]).length === 0) {
+			console.error('[dave] marshalled key package is empty', {channelId: this.channelId});
+			return;
+		}
+		this.pendingKeyPackage = false;
 		this.send({type: 'key_package', data: encodeBytes(kp as number[])});
 	}
 
@@ -292,6 +314,8 @@ export class DaveClient {
 			let privateKey = null;
 			privateKey = this.transientKeys.GetTransientPrivateKey(protocolVersion);
 			this.session.Init(protocolVersion, BigInt(this.channelId), this.selfUserId, privateKey);
+			this.externalSenderSet = false;
+			this.pendingKeyPackage = false;
 		}
 	}
 

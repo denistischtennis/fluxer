@@ -122,6 +122,16 @@ interface DaveKeyMaterialSink {
 	setPassthrough(identity: string, enabled: boolean): void;
 }
 
+/**
+ * LiveKit identities are `user_<snowflake>_<connection_id>`; the DAVE/MLS
+ * domain (leaf credentials via std::stoull, DS proposals and welcomes) speaks
+ * raw snowflake strings. Convert once here; the E2EE worker keeps LiveKit ids.
+ */
+function daveUserIdFromIdentity(identity: string | null | undefined): string | null {
+	const m = identity ? /^user_(\d+)(?:_|$)/.exec(identity) : null;
+	return m ? m[1] : null;
+}
+
 function createRoomKeySink(room: Room): DaveKeyMaterialSink {
 	return {
 		setRatchet: (identity, ratchet) => room.setParticipantRatchet(identity, ratchet),
@@ -222,6 +232,10 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	 * teardownDave. Capped FIFO.
 	 */
 	private earlyDaveEvents: DaveDownMessage[] = [];
+	/** MLS-domain (snowflake) user id of the local participant. */
+	private daveSelfUserId: string | null = null;
+	/** MLS user id -> LiveKit identity, for pushing ratchets into the room sink. */
+	private readonly daveUserToIdentity = new Map<string, string>();
 	// Sink installed by the join path to push ratchets and passthrough windows
 	// into the E2EE worker of the currently active room.
 	private daveKeySink: DaveKeyMaterialSink | null = null;
@@ -294,17 +308,22 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		if (client === null || sink === null) {
 			return;
 		}
-		const selfId = this.selfUserId();
-		if (selfId) {
-			sink.setRatchet(selfId, client.getRatchet(selfId));
+		const selfLkId = this.selfUserId();
+		const selfUid = this.daveSelfUserId;
+		if (selfLkId && selfUid) {
+			sink.setRatchet(selfLkId, client.getRatchet(selfUid));
 		}
 		const passthrough = client.status === 'passthrough';
-		for (const peerId of client.getRecognizedUsers()) {
-			const ratchet = client.getRatchet(peerId);
-			if (ratchet !== null) {
-				sink.setRatchet(peerId, ratchet);
+		for (const uid of client.getRecognizedUsers()) {
+			const lkId = this.daveUserToIdentity.get(uid);
+			if (!lkId) {
+				continue;
 			}
-			sink.setPassthrough(peerId, passthrough);
+			const ratchet = client.getRatchet(uid);
+			if (ratchet !== null) {
+				sink.setRatchet(lkId, ratchet);
+			}
+			sink.setPassthrough(lkId, passthrough);
 		}
 	}
 
@@ -313,7 +332,13 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		if (client === null || !peerIdentity) {
 			return;
 		}
-		client.recognizeUser(peerIdentity);
+		const uid = daveUserIdFromIdentity(peerIdentity);
+		if (uid === null) {
+			logger.warn('DAVE ignoring peer with unparseable identity', {peerIdentity});
+			return;
+		}
+		this.daveUserToIdentity.set(uid, peerIdentity);
+		client.recognizeUser(uid);
 		this.syncDaveKeyMaterial();
 	}
 
@@ -322,7 +347,11 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		if (client === null || !peerIdentity) {
 			return;
 		}
-		client.forgetUser(peerIdentity);
+		const uid = daveUserIdFromIdentity(peerIdentity);
+		if (uid !== null) {
+			client.forgetUser(uid);
+			this.daveUserToIdentity.delete(uid);
+		}
 		// An explicit null ratchet release also tears the peer's receive cryptor
 		// down in the worker (distinct from "not established yet", which is
 		// simply not pushed).
@@ -338,7 +367,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	private bindDaveSession(room: Room, client: DaveClient): void {
 		this.registerDaveClient(client, createRoomKeySink(room));
 		for (const peer of room.remoteParticipants.values()) {
-			client.recognizeUser(peer.identity);
+			this.handleDavePeerJoined(peer.identity);
 		}
 		room.on(RoomEvent.ParticipantConnected, (peer) => this.handleDavePeerJoined(peer.identity));
 		room.on(RoomEvent.ParticipantDisconnected, (peer) => this.handleDavePeerLeft(peer.identity));
@@ -1378,7 +1407,14 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 					});
 				},
 			};
-			const client = new DaveClient({mod, selfUserId: selfId, channelId, transport});
+			const selfUid = daveUserIdFromIdentity(selfId);
+			if (selfUid === null) {
+				logger.error('DAVE setup aborted: local identity is not a fluxer user identity', {selfId});
+				return;
+			}
+			const client = new DaveClient({mod, selfUserId: selfUid, channelId, transport});
+			this.daveSelfUserId = selfUid;
+			this.daveUserToIdentity.set(selfUid, selfId);
 			this.tofuUnavailableLogged = false;
 			this.bindDaveSession(room, client);
 			logger.info('DAVE client bound to room', {selfId, channelId});
@@ -1424,6 +1460,8 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		this.daveKeySink = null;
 		this.tofuUnavailableLogged = false;
 		this.earlyDaveEvents = [];
+		this.daveSelfUserId = null;
+		this.daveUserToIdentity.clear();
 	}
 
 	private disconnectPreviousRoom(previousRoom: Room | null, stopTracks = true): void {
