@@ -7,6 +7,7 @@
     init_voice_queue/0,
     process_voice_queue/1,
     handle_voice_state_update/2,
+    handle_dave_protocol_message/2,
     handle_voice_disconnect/1
 ]).
 
@@ -46,6 +47,77 @@ process_voice_queue_item(Item, State) ->
 -spec handle_voice_state_update(map(), session_state()) -> voice_state_reply().
 handle_voice_state_update(Data, State) ->
     session_voice_connect:handle_voice_state_update(Data, State).
+
+%% --------------------------------------------------------------------------
+%% Route an inbound opcode-17 DAVE message to whatever owns the MLS room for
+%% that channel: the guild voice server when a `guild_id` is present, otherwise
+%% the DM call's gen_server. The authenticated session user id is passed as a
+%% binary snowflake (the coordinator's key representation).
+%% --------------------------------------------------------------------------
+-spec handle_dave_protocol_message(map(), session_state()) -> voice_state_reply().
+handle_dave_protocol_message(Data, State) when is_map(Data) ->
+    ChannelIdBin = maps:get(<<"channel_id">>, Data, <<>>),
+    SenderBin = integer_to_binary(maps:get(user_id, State)),
+    case parse_guild_id(maps:get(<<"guild_id">>, Data, null)) of
+        {ok, GId} ->
+            case guild_voice_server:lookup(GId) of
+                {ok, VPid} ->
+                    try
+                        gen_server:call(
+                            VPid, {dave_message, ChannelIdBin, SenderBin, Data}, 5000
+                        )
+                    catch
+                        _:_ -> ok
+                    end;
+                {error, not_found} ->
+                    logger:warning("dave message: no voice server for guild", #{guild_id => GId})
+            end;
+        error ->
+            route_dave_to_call(ChannelIdBin, SenderBin, Data)
+    end,
+    {reply, ok, State}.
+
+%% A DAVE message without `guild_id` belongs to a DM call. The call gen_server is
+%% the single owner of that call's MLS room, so route by channel id. Unknown or
+%% already-ended calls are logged and dropped rather than failing the session.
+-spec route_dave_to_call(binary(), binary(), map()) -> ok.
+route_dave_to_call(<<>>, _SenderBin, _Data) ->
+    logger:warning("dave message: missing channel_id", #{}),
+    ok;
+route_dave_to_call(ChannelIdBin, SenderBin, Data) ->
+    case call_manager:lookup(call_channel_id(ChannelIdBin)) of
+        {ok, CallPid} ->
+            try
+                gen_server:call(CallPid, {dave_message, SenderBin, Data}, 5000)
+            catch
+                _:_ ->
+                    ok
+            end;
+        Other ->
+            logger:warning("dave message: no call for channel", #{
+                channel_id => ChannelIdBin, lookup => Other
+            }),
+            ok
+    end.
+
+-spec call_channel_id(binary()) -> integer() | binary().
+call_channel_id(Bin) when is_binary(Bin) ->
+    try
+        binary_to_integer(Bin)
+    catch
+        _:_ -> Bin
+    end.
+
+parse_guild_id(Bin) when is_binary(Bin) ->
+    try
+        {ok, binary_to_integer(Bin)}
+    catch
+        _:_ -> error
+    end;
+parse_guild_id(Int) when is_integer(Int) ->
+    {ok, Int};
+parse_guild_id(_) ->
+    error.
 
 -spec handle_voice_disconnect(session_state()) -> voice_state_reply().
 handle_voice_disconnect(State) ->

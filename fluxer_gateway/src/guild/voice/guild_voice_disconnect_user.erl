@@ -94,8 +94,8 @@ do_voice_disconnect(
     NewState1 = guild_voice_disconnect_broadcast:clear_recently_disconnected(
         ConnectionId, NewState0
     ),
-    NewState = guild_voice_disconnect_broadcast:clear_e2ee_room_key_if_channel_idle(
-        ChannelId, NewVoiceStates, NewState1
+    NewState = guild_voice_disconnect_broadcast:retire_voice_states(
+        [ChannelId], #{ConnectionId => OldVoiceState}, NewVoiceStates, NewState1
     ),
     voice_state_utils:broadcast_disconnects(#{ConnectionId => OldVoiceState}, NewState),
     FinalState = maybe_cleanup_after_disconnect(UserId, ChannelId, NewState),
@@ -129,8 +129,12 @@ disconnect_all_user_connections(UserId, RequestSessionId, VoiceStates, State) ->
             ok = guild_voice_disconnect_broadcast:purge_count_cache(maps:keys(UserVoiceStates)),
             NewVoiceStates = voice_state_utils:drop_voice_states(UserVoiceStates, VoiceStates),
             NewState0 = State#{voice_states => NewVoiceStates},
-            NewState1 = guild_voice_disconnect_broadcast:clear_e2ee_room_keys_for_removed(
-                UserVoiceStates, NewVoiceStates, NewState0
+            AffectedChannels = lists:usort([
+                voice_state_utils:voice_state_channel_id(VS)
+             || {_, VS} <- maps:to_list(UserVoiceStates)
+            ]),
+            NewState1 = guild_voice_disconnect_broadcast:retire_voice_states(
+                AffectedChannels, UserVoiceStates, NewVoiceStates, NewState0
             ),
             NewState = clear_recently_disconnected_connections(UserVoiceStates, NewState1),
             voice_state_utils:broadcast_disconnects(UserVoiceStates, NewState),
@@ -175,8 +179,11 @@ handle_specific_disconnect(UserId, ConnId, VoiceState, VoiceStates, State) ->
             NewState1 = guild_voice_disconnect_broadcast:clear_recently_disconnected(
                 ConnId, NewState0
             ),
-            NewState = guild_voice_disconnect_broadcast:clear_e2ee_room_key_if_channel_idle(
-                voice_state_utils:voice_state_channel_id(VoiceState), NewVoiceStates, NewState1
+            NewState = guild_voice_disconnect_broadcast:retire_voice_states(
+                [voice_state_utils:voice_state_channel_id(VoiceState)],
+                #{ConnId => VoiceState},
+                NewVoiceStates,
+                NewState1
             ),
             voice_state_utils:broadcast_disconnects(#{ConnId => VoiceState}, NewState),
             FinalState = maybe_cleanup_virtual_channel_access(UserId, NewVoiceStates, NewState),

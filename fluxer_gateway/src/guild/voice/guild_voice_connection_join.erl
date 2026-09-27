@@ -204,18 +204,28 @@ build_new_voice_state(Build) ->
         voice_state => VoiceState
     }),
     State2 = guild_voice_connection_pending:store_pending(ConnectionId, PendingMetadata, State),
-    {State3, E2EEKeyForReply} = guild_voice_e2ee:maybe_room_key_for_reply_guild(
-        Context, ChannelIdValue, State2
-    ),
-    BaseReply = #{
-        success => true,
-        token => Token,
-        endpoint => Endpoint,
-        connection_id => ConnectionId,
-        voice_state => voice_state_utils:external_voice_state(VoiceState)
-    },
+    DaveEnabled = guild_voice_e2ee:context_e2ee_capable_guild(Context, State2),
+    {DaveVersion, State3} =
+        case DaveEnabled of
+            true ->
+                guild_voice_dave:negotiate_join(
+                    integer_to_binary(maps:get(user_id, Context)),
+                    maps:get(dave_max_version, Context, 1),
+                    guild_voice_connection_util:snowflake_bin(ChannelIdValue),
+                    State2
+                );
+            false ->
+                {null, State2}
+        end,
     {reply,
-        guild_voice_connection_util:maybe_attach_e2ee_key_to_reply(BaseReply, E2EEKeyForReply),
+        #{
+            success => true,
+            token => Token,
+            endpoint => Endpoint,
+            connection_id => ConnectionId,
+            dave_version => DaveVersion,
+            voice_state => voice_state_utils:external_voice_state(VoiceState)
+        },
         State3}.
 
 -spec voice_build_fields(map()) -> map().

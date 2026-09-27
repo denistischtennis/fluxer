@@ -119,20 +119,29 @@ build_move_result(Build) ->
     State2 = guild_voice_connection_pending:store_pending(
         NewConnectionId, PendingMetadata, State1Cleaned
     ),
-    {State3, E2EEKeyForReply} = guild_voice_e2ee:maybe_room_key_for_reply_guild(
-        Context, ChannelIdValue, State2
-    ),
+    DaveEnabled = guild_voice_e2ee:context_e2ee_capable_guild(Context, State2),
+    {DaveVersion, State3} =
+        case DaveEnabled of
+            true ->
+                guild_voice_dave:negotiate_join(
+                    integer_to_binary(maps:get(user_id, Context)),
+                    maps:get(dave_max_version, Context, 1),
+                    guild_voice_connection_util:snowflake_bin(ChannelIdValue),
+                    State2
+                );
+            false ->
+                {null, State2}
+        end,
     MoveReply = #{
         success => true,
         needs_token => true,
         token => Token,
         endpoint => Endpoint,
         connection_id => NewConnectionId,
+        dave_version => DaveVersion,
         voice_state => voice_state_utils:external_voice_state(VoiceState)
     },
-    {reply,
-        guild_voice_connection_util:maybe_attach_e2ee_key_to_reply(MoveReply, E2EEKeyForReply),
-        State3}.
+    {reply, MoveReply, State3}.
 
 -spec cleanup_stale_virtual_access(map(), guild_state()) -> guild_state().
 cleanup_stale_virtual_access(Build, State) ->
@@ -148,9 +157,11 @@ disconnect_old_connection(Build) ->
     VoiceStates = maps:get(voice_states, Build),
     OldChannelIdBin = maps:get(<<"channel_id">>, ExistingVoiceState, null),
     NewVoiceStates = maps:remove(OldConnectionId, VoiceStates),
-    State1Base = State#{voice_states => NewVoiceStates},
-    State1 = guild_voice_connection_pending:clear_e2ee_room_key_if_channel_idle(
-        voice_state_utils:voice_state_channel_id(ExistingVoiceState), NewVoiceStates, State1Base
+    State1 = guild_voice_disconnect_broadcast:retire_voice_states(
+        [voice_state_utils:voice_state_channel_id(ExistingVoiceState)],
+        #{OldConnectionId => ExistingVoiceState},
+        NewVoiceStates,
+        State#{voice_states => NewVoiceStates}
     ),
     DisconnectVS = ExistingVoiceState#{<<"channel_id">> => null},
     guild_voice_broadcast:broadcast_voice_state_update(DisconnectVS, State1, OldChannelIdBin),

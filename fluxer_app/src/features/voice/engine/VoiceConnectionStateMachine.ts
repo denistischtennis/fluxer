@@ -45,7 +45,6 @@ export interface VoiceConnectionServerUpdatePayload {
 	connection_id: string | null;
 	guild_id?: string | null;
 	channel_id?: string | null;
-	e2ee_key?: string | null;
 }
 
 export interface VoiceConnectionHotSwapContext {
@@ -628,8 +627,7 @@ export function selectVoiceConnectionServerUpdateDecision(
 		!!endpoint &&
 		!!token &&
 		!!context.voiceServerEndpoint &&
-		endpoint !== context.voiceServerEndpoint &&
-		!raw.e2ee_key;
+		endpoint !== context.voiceServerEndpoint;
 	return {
 		type: 'accept',
 		attemptId,

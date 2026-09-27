@@ -25,7 +25,6 @@
 -define(SWEEP_INTERVAL_MS, 10000).
 -define(MAX_PENDING_CONNECTIONS, 1000).
 -define(MAX_RECENT_DISCONNECTS, 500).
--define(MAX_E2EE_KEYS, 1000).
 -define(PENDING_TTL_MS, 300000).
 -define(RECENT_DISCONNECT_TTL_MS, 120000).
 -define(E2EE_KEY_TTL_MS, 300000).
@@ -39,7 +38,7 @@
     voice_states := voice_state_map(),
     pending_voice_connections := map(),
     recently_disconnected_voice_states := map(),
-    e2ee_room_keys := map()
+    dave_rooms := #{binary() => voice_dave_coordinator:room_state()}
 }.
 
 -spec start_link(integer(), pid()) -> gen_server:start_ret().
@@ -144,7 +143,7 @@ init(#{guild_id := GuildId, guild_pid := GuildPid} = Args) ->
         voice_states => InitialVoiceStates,
         pending_voice_connections => #{},
         recently_disconnected_voice_states => #{},
-        e2ee_room_keys => #{}
+        dave_rooms => #{}
     },
     ok = schedule_seeded_session_check(first, maps:keys(InitialVoiceStates)),
     {ok, State}.
@@ -208,8 +207,44 @@ handle_call_local(get_voice_server_pid, State) ->
     {reply, {ok, self()}, State};
 handle_call_local({set_voice_states, VoiceStates}, State) when is_map(VoiceStates) ->
     {reply, ok, do_set_voice_states(VoiceStates, State)};
+handle_call_local({dave_join, ChIdBin, UserId, MaxVer}, State) ->
+    RoomState = dave_room(ChIdBin, State),
+    Members = dave_members_from(RoomState),
+    {Version, NewRoom} = guild_voice_dave:drive_join(UserId, MaxVer, RoomState, Members),
+    {reply, {ok, Version}, put_dave_room(ChIdBin, NewRoom, State)};
+handle_call_local({dave_message, ChIdBin, Sender, Raw}, State) ->
+    RoomState = dave_room(ChIdBin, State),
+    Members = dave_members_from(RoomState),
+    NewRoom = guild_voice_dave:drive_message(ChIdBin, Raw, Sender, RoomState, Members),
+    {reply, ok, put_dave_room(ChIdBin, NewRoom, State)};
+handle_call_local({dave_member_left, ChIdBin, UserBin}, State) ->
+    RoomState = dave_room(ChIdBin, State),
+    Members = dave_members_from(RoomState),
+    NewRoom = guild_voice_dave:drive_member_left(ChIdBin, UserBin, RoomState, Members),
+    {reply, ok, put_dave_room(ChIdBin, NewRoom, State)};
 handle_call_local(_, State) ->
     {reply, ok, State}.
+
+%% --- DAVE room-state accessors -----------------------------------------
+-spec dave_room(binary(), server_state()) -> voice_dave_coordinator:room_state().
+dave_room(ChIdBin, State) ->
+    Rooms = maps:get(dave_rooms, State, #{}),
+    case maps:get(ChIdBin, Rooms, undefined) of
+        undefined -> voice_dave_coordinator:new_room_state(false);
+        RS -> RS
+    end.
+
+-spec put_dave_room(binary(), voice_dave_coordinator:room_state(), server_state()) ->
+    server_state().
+put_dave_room(ChIdBin, RoomState, State) ->
+    Rooms = maps:get(dave_rooms, State, #{}),
+    State#{dave_rooms => Rooms#{ChIdBin => RoomState}}.
+
+%% Members for broadcast fan-out: users with a key package in the room (binary
+%% snowflake ids). Derived from the room itself so no cross-representation juggling.
+-spec dave_members_from(voice_dave_coordinator:room_state()) -> fun(() -> [binary()]).
+dave_members_from(RoomState) ->
+    fun() -> maps:keys(maps:get(key_packages, RoomState, #{})) end.
 
 -spec channel_query(voice_states | pending_joins, term(), server_state()) -> map().
 channel_query(Kind, ChIdBin, State) ->
@@ -249,14 +284,13 @@ handle_cast(_, State) ->
 handle_info(sweep_pending_joins, State) ->
     erlang:send_after(?SWEEP_INTERVAL_MS, self(), sweep_pending_joins),
     State1 = sweep_recently_disconnected(State),
-    State2 = sweep_e2ee_room_keys(State1),
-    case maps:size(maps:get(pending_voice_connections, State2, #{})) of
+    case maps:size(maps:get(pending_voice_connections, State1, #{})) of
         0 ->
-            {noreply, State2};
+            {noreply, State1};
         _ ->
-            GuildState = guild_voice_server_state:build_guild_state(State2),
+            GuildState = guild_voice_server_state:build_guild_state(State1),
             NewGuildState = guild_voice_connection:sweep_expired_pending_joins(GuildState),
-            {noreply, guild_voice_server_state:apply_guild_state(NewGuildState, State2)}
+            {noreply, guild_voice_server_state:apply_guild_state(NewGuildState, State1)}
     end;
 handle_info({check_seeded_sessions, Round, ConnectionIds}, State) ->
     ok = spawn_seeded_session_check(Round, seeded_sessions(ConnectionIds, State), State),
@@ -272,6 +306,11 @@ handle_info({'EXIT', Pid, Reason}, #{guild_pid := GuildPid} = State) when Pid =:
         #{guild_id => maps:get(guild_id, State), reason => Reason}
     ),
     {stop, normal, State};
+handle_info({dave_timer, ChIdBin, Msg}, State) ->
+    RoomState = dave_room(ChIdBin, State),
+    Members = dave_members_from(RoomState),
+    NewRoom = guild_voice_dave:drive_timer(ChIdBin, Msg, RoomState, Members),
+    {noreply, put_dave_room(ChIdBin, NewRoom, State)};
 handle_info(_, State) ->
     {noreply, State}.
 
@@ -526,18 +565,6 @@ evict_stale_disconnects(Cache) ->
     end,
     enforce_map_cap(maps:filter(IsAlive, Cache), ?MAX_RECENT_DISCONNECTS).
 
--spec sweep_e2ee_room_keys(server_state()) -> server_state().
-sweep_e2ee_room_keys(State) ->
-    Keys = maps:get(e2ee_room_keys, State, #{}),
-    case maps:size(Keys) of
-        0 ->
-            State;
-        Size when Size =< ?MAX_E2EE_KEYS ->
-            State;
-        _ ->
-            State#{e2ee_room_keys => enforce_map_cap(Keys, ?MAX_E2EE_KEYS)}
-    end.
-
 -spec enforce_map_cap(map(), pos_integer()) -> map().
 enforce_map_cap(Map, MaxSize) ->
     case maps:size(Map) =< MaxSize of
@@ -630,7 +657,7 @@ seeded_test_state(GuildPid) ->
         },
         pending_voice_connections => #{},
         recently_disconnected_voice_states => #{},
-        e2ee_room_keys => #{}
+        dave_rooms => #{}
     }.
 
 disconnect_voice_user_cast_removes_the_voice_state_test() ->
@@ -653,7 +680,7 @@ disconnect_voice_user_cast_removes_the_voice_state_test() ->
         },
         pending_voice_connections => #{},
         recently_disconnected_voice_states => #{},
-        e2ee_room_keys => #{}
+        dave_rooms => #{}
     },
     try
         {noreply, NewState} = handle_cast(
@@ -683,18 +710,26 @@ guild_state_reply_loop(TestFun) ->
             guild_state_reply_loop(TestFun)
     end.
 
-apply_guild_state_preserves_e2ee_test() ->
+apply_guild_state_preserves_dave_rooms_test() ->
+    Room1 = voice_dave_coordinator:new_room_state(false),
+    Room2 = Room1#{epoch => 7},
     State = #{
         guild_id => 1,
         guild_pid => self(),
         voice_states => #{},
         pending_voice_connections => #{},
         recently_disconnected_voice_states => #{},
-        e2ee_room_keys => #{10 => <<"old-key">>}
+        dave_rooms => #{<<"10">> => Room1}
     },
-    GuildState = State#{e2ee_room_keys => #{10 => <<"new-key">>}},
+    GuildState = State#{dave_rooms => #{<<"10">> => Room2}},
     NewState = guild_voice_server_state:merge_guild_state(GuildState, State),
-    ?assertEqual(#{10 => <<"new-key">>}, maps:get(e2ee_room_keys, NewState)).
+    ?assertEqual(
+        #{<<"10">> => Room2},
+        maps:get(dave_rooms, NewState)
+    ),
+    %% and the other direction: a guild state without rooms keeps the server's own.
+    Kept = guild_voice_server_state:merge_guild_state(#{}, State),
+    ?assertEqual(#{<<"10">> => Room1}, maps:get(dave_rooms, Kept)).
 
 resolve_asks_fallback_test() ->
     GuildId = 987654321,

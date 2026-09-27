@@ -27,6 +27,7 @@
 		"@fluxer/i18n": "workspace:*",
 		"@fluxer/instance_bootstrap": "workspace:*",
 		"@fluxer/ip_utils": "workspace:*",
+		"@fluxer/libdave": "workspace:*",
 		"@fluxer/limits": "workspace:*",
 		"@fluxer/logger": "workspace:*",
 		"@fluxer/schema": "workspace:*",

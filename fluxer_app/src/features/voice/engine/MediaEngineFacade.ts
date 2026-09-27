@@ -1501,6 +1501,17 @@ class MediaEngineFacade extends Store {
 		}
 		this.handleVoiceServerUpdateViaJs(raw);
 	}
+	/**
+	 * Route a gateway DAVE_PROTOCOL_EVENT into the active connection's DAVE
+	 * session. The connection host adapter owns the DaveClient and pushes any
+	 * resulting ratchets into the room E2EE worker.
+	 */
+	handleDaveProtocolEvent(data: import('../events/DaveProtocolEvent.js').DaveProtocolEventPayload): void {
+		if (!voiceEngineV2AppConnectionHostAdapter.connected) {
+			return;
+		}
+		voiceEngineV2AppConnectionHostAdapter.routeDaveProtocolEvent(data);
+	}
 
 	private handleVoiceServerUpdateViaJs(raw: VoiceServerUpdateData): void {
 		const expectedChannelId = voiceEngineV2AppConnectionHostAdapter.channelId;

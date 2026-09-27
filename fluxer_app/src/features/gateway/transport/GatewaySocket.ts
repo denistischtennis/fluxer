@@ -523,6 +523,24 @@ export class GatewaySocket extends EventEmitter<GatewaySocketEvents> {
 	updateVoiceStateExplicit(params: GatewayVoiceStateUpdateParams): boolean {
 		return this.sendPayload(this.buildVoiceStatePayload(params, {useCurrentConnectionFallback: false}));
 	}
+	/**
+	 * Send an inbound-registered DAVE protocol message (opcode 17) uplink.
+	 * The DaveClient transport calls this for key_package / commit_welcome /
+	 * ready_for_transition / invalid_commit_welcome events.
+	 */
+	sendDaveProtocolMessage(payload: {
+		channel_id: string;
+		guild_id?: string | null;
+		type: string;
+		transition_id?: number;
+		data?: string;
+	}): boolean {
+		return this.sendPayload({
+			op: GatewayOpcodes.DAVE_PROTOCOL_MESSAGE,
+			d: payload,
+		});
+	}
+
 
 	requestGuildMembers(params: {
 		guildId?: string;

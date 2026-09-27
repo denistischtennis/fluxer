@@ -16,7 +16,7 @@
     maybe_attach_member/2,
     maybe_attach_geolocation/3,
     maybe_attach_voice_routing_metadata/3,
-    maybe_attach_e2ee_key_to_reply/2,
+    snowflake_bin/1,
     normalize_session_id/1,
     normalize_optional_binary/1,
     maybe_error_reply/5,
@@ -60,7 +60,8 @@ build_context(Request0) ->
         viewer_stream_keys => maps:get(viewer_stream_keys, Request, undefined),
         latitude => Coord(maps:get(latitude, Request, undefined)),
         longitude => Coord(maps:get(longitude, Request, undefined)),
-        e2ee_capable => Norm(maps:get(e2ee_capable, Request, false)),
+        e2ee_capable => session_init:dave_capable(maps:get(dave_max_version, Request, 0)),
+        dave_max_version => maps:get(dave_max_version, Request, 0),
         bot => Norm(maps:get(bot, Request, false))
     }.
 
@@ -147,11 +148,11 @@ maybe_attach_voice_routing_metadata(VoiceState, RegionIdRaw, ServerIdRaw) ->
     VS1 = maybe_put_field(VoiceState, <<"region_id">>, RegionId),
     maybe_put_field(VS1, <<"server_id">>, ServerId).
 
--spec maybe_attach_e2ee_key_to_reply(map(), binary() | undefined) -> map().
-maybe_attach_e2ee_key_to_reply(Reply, undefined) ->
-    Reply;
-maybe_attach_e2ee_key_to_reply(Reply, Key) when is_binary(Key) ->
-    Reply#{e2ee_key => Key}.
+%% Normalize a snowflake (integer or binary) into its binary string form; used for
+%% map keys such as the DAVE `dave_rooms' channel index.
+-spec snowflake_bin(integer() | binary()) -> binary().
+snowflake_bin(Bin) when is_binary(Bin) -> Bin;
+snowflake_bin(Int) when is_integer(Int) -> integer_to_binary(Int).
 
 -spec normalize_session_id(term()) -> binary() | undefined.
 normalize_session_id(Value) ->

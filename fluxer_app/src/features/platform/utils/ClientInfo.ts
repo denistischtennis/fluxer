@@ -367,6 +367,26 @@ function isLiveKitE2EECapable(): boolean {
 	}
 }
 
+let daveVersionPromise: Promise<number> | null = null;
+
+/**
+ * Lazily load the libdave WASM once and read its max supported DAVE protocol
+ * version. Returns 0 when the module cannot be loaded (no WASM support, CSP
+ * block, etc.) so the caller degrades to non-DAVE. Cached across calls.
+ */
+export function getDaveMaxVersion(): Promise<number> {
+	if (typeof window === 'undefined' || typeof Worker === 'undefined') {
+		return Promise.resolve(0);
+	}
+	if (daveVersionPromise === null) {
+		daveVersionPromise = import('@fluxer/libdave/wasm')
+			.then(({DaveModuleFactory}) => DaveModuleFactory())
+			.then((mod) => mod.MaxSupportedProtocolVersion() as number)
+			.catch(() => 0);
+	}
+	return daveVersionPromise;
+}
+
 export async function getGatewayClientProperties(geo?: {latitude?: string | null; longitude?: string | null}) {
 	const info = await getClientInfo();
 	return {
@@ -384,6 +404,7 @@ export async function getGatewayClientProperties(geo?: {latitude?: string | null
 		desktop_arch: info.desktopArch ?? info.arch ?? null,
 		desktop_os: info.desktopOS ?? info.osName ?? null,
 		e2ee_capable: isLiveKitE2EECapable(),
+		dave_max_version: await getDaveMaxVersion(),
 		...(geo?.latitude ? {latitude: geo.latitude} : {}),
 		...(geo?.longitude ? {longitude: geo.longitude} : {}),
 	};

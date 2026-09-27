@@ -67,6 +67,7 @@ import {handleCallDelete} from '@app/features/voice/events/CallDelete';
 import {handleCallUpdate} from '@app/features/voice/events/CallUpdate';
 import {handleEntranceSoundPlay} from '@app/features/voice/events/EntranceSoundPlay';
 import {handleVoiceServerUpdate} from '@app/features/voice/events/VoiceServerUpdate';
+import {handleDaveProtocolEvent} from '@app/features/voice/events/DaveProtocolEvent';
 import {handleVoiceStateUpdate} from '@app/features/voice/events/VoiceStateUpdate';
 
 export interface GatewayGeoipPayload {
@@ -144,6 +145,7 @@ export function createHandlerRegistry(): GatewayHandlerRegistry {
 	registry.set('PRESENCE_UPDATE_BULK', handlePresenceUpdateBulk as GatewayEventHandler);
 	registry.set('VOICE_STATE_UPDATE', handleVoiceStateUpdate as GatewayEventHandler);
 	registry.set('VOICE_SERVER_UPDATE', handleVoiceServerUpdate as GatewayEventHandler);
+	registry.set('DAVE_PROTOCOL_EVENT', handleDaveProtocolEvent as GatewayEventHandler);
 	registry.set('CALL_CREATE', handleCallCreate as GatewayEventHandler);
 	registry.set('CALL_UPDATE', handleCallUpdate as GatewayEventHandler);
 	registry.set('CALL_DELETE', handleCallDelete as GatewayEventHandler);

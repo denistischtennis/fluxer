@@ -1,0 +1,25 @@
+{
+	"name": "@fluxer/libdave",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "Vendored DAVE protocol library (libdave) with browser and node WASM artefacts",
+	"exports": {
+		".": "./js/index.ts",
+		"./wasm": "./js/wasm-web.ts",
+		"./delivery": "./js/wasm-node.ts"
+	},
+	"scripts": {
+		"test": "vitest run",
+		"build:wasm": "bash scripts/build_wasm.sh"
+	},
+	"dependencies": {
+		"@noble/hashes": "1.5.0",
+		"base64-js": "1.5.1"
+	},
+	"devDependencies": {
+		"@types/node": "catalog:",
+		"typescript": "catalog:ts7",
+		"vitest": "catalog:"
+	}
+}

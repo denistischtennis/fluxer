@@ -105,6 +105,7 @@ function defaultConfig(): MasterConfig {
 				max_inflight_requests: 512,
 				ip_ban_exempt_ips: [],
 				donation_proxy_key: '',
+				dave_seed: '',
 				presigned_attachment_uploads_enabled: false,
 				presigned_harvest_downloads_enabled: true,
 				unfurl_ignored_hosts: [],

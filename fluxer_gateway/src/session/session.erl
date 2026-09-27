@@ -54,6 +54,7 @@
     bot => boolean(),
     shard => gateway_sharding:shard() | undefined,
     e2ee_capable => boolean(),
+    dave_max_version => non_neg_integer(),
     ignored_events => #{binary() => true},
     initial_guild_id => guild_id() | undefined,
     collected_guild_states => [map()],
@@ -117,6 +118,8 @@ handle_call({terminate, SessionIdHashes}, _From, State) ->
     end;
 handle_call({voice_state_update, Data}, _From, State) when is_map(Data) ->
     session_voice:handle_voice_state_update(Data, State);
+handle_call({dave_protocol_message, Data}, _From, State) when is_map(Data) ->
+    session_voice:handle_dave_protocol_message(Data, State);
 handle_call(_, _From, State) ->
     {reply, ok, State}.
 

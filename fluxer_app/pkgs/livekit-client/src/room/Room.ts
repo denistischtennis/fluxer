@@ -411,6 +411,25 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 		}
 	}
 
+	/** DAVE: forward a participant key ratchet to the E2EE worker. */
+	setParticipantRatchet(
+		participantIdentity: string,
+		ratchet: {cipherSuite: number; baseSecret: number[]} | null,
+		transitionExpiryMs?: number,
+	): void {
+		this.e2eeManager?.setParticipantRatchet(participantIdentity, ratchet, transitionExpiryMs);
+	}
+
+	/** DAVE: toggle passthrough for a participant (version-0 / pre-transition). */
+	setParticipantPassthrough(participantIdentity: string, enabled: boolean, transitionExpiryMs?: number): void {
+		this.e2eeManager?.setParticipantPassthrough(participantIdentity, enabled, transitionExpiryMs);
+	}
+
+	/** DAVE: map an outbound track's synthetic SSRC to its codec. */
+	assignTrackCodec(participantIdentity: string, ssrc: number, codec: number): void {
+		this.e2eeManager?.assignTrackCodec(participantIdentity, ssrc, codec);
+	}
+
 	private setupE2EE() {
 		const dcEncryptionEnabled = !!this.options.encryption;
 		const e2eeOptions = this.options.encryption || this.options.e2ee;

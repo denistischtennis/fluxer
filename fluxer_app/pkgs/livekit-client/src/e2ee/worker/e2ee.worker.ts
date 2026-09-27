@@ -21,6 +21,7 @@ import type {
 	ScriptTransformOptions,
 } from '../types.ts';
 import {DataCryptor} from './DataCryptor.ts';
+import {createDaveDecodeTransform, createDaveEncodeTransform} from './DaveTransform.ts';
 import {ErrorRateLimiter} from './ErrorRateLimiter.ts';
 import {encryptionEnabledMap, FrameCryptor} from './FrameCryptor.ts';
 import {ParticipantKeyHandler} from './ParticipantKeyHandler.ts';
@@ -31,6 +32,43 @@ let sharedKeyHandler: ParticipantKeyHandler | undefined;
 const messageQueue = new AsyncQueue();
 
 const isEncryptionEnabled: boolean = false;
+
+// --- DAVE-mode crypto state -------------------------------------------------
+// Populated lazily when the room is initialised with `mode: 'dave'`. Send-side
+// cryptors are keyed by participant identity (our own outbound sender);
+// receive-side by remote participant identity (the ratchet is per-sender).
+import type {DaveReceiveCryptor, DaveSendCryptor} from '@fluxer/dave';
+
+const daveSendCryptors: Map<string, DaveSendCryptor> = new Map();
+const daveReceiveCryptors: Map<string, DaveReceiveCryptor> = new Map();
+let daveMode = false;
+
+async function ensureDaveModule() {
+	const {DaveModuleFactory} = await import('@fluxer/libdave/wasm');
+	return DaveModuleFactory();
+}
+
+async function getDaveSendCryptor(identity: string): Promise<DaveSendCryptor> {
+	let c = daveSendCryptors.get(identity);
+	if (!c) {
+		const {DaveSendCryptor: SendCtor} = await import('@fluxer/dave');
+		const mod = await ensureDaveModule();
+		c = new SendCtor(mod);
+		daveSendCryptors.set(identity, c);
+	}
+	return c;
+}
+
+async function getDaveReceiveCryptor(identity: string): Promise<DaveReceiveCryptor> {
+	let c = daveReceiveCryptors.get(identity);
+	if (!c) {
+		const {DaveReceiveCryptor: RecvCtor} = await import('@fluxer/dave');
+		const mod = await ensureDaveModule();
+		c = new RecvCtor(mod);
+		daveReceiveCryptors.set(identity, c);
+	}
+	return c;
+}
 
 let useSharedKey: boolean = false;
 
@@ -61,9 +99,13 @@ self.addEventListener('message', (ev) => {
 				workerLogger.info('e2ee worker initialized');
 				keyProviderOptions = data.keyProviderOptions;
 				useSharedKey = !!data.keyProviderOptions.sharedKey;
+				daveMode = (data as {mode?: string}).mode === 'dave';
+				if (daveMode) {
+					await ensureDaveModule();
+				}
 				const ackMsg: InitAck = {
 					kind: 'initAck',
-					data: {enabled: isEncryptionEnabled},
+					data: {enabled: isEncryptionEnabled || daveMode},
 				};
 				postMessage(ackMsg);
 				break;
@@ -77,12 +119,28 @@ self.addEventListener('message', (ev) => {
 				postMessage(ev.data);
 				break;
 			case 'decode': {
+				if (daveMode) {
+					const recv = await getDaveReceiveCryptor(data.participantIdentity);
+					data.readableStream
+						.pipeThrough(createDaveDecodeTransform(recv))
+						.pipeTo(data.writableStream)
+						.catch((e) => workerLogger.warn('dave decode transform error', {error: e}));
+					break;
+				}
 				const cryptor = getTrackCryptor(data.participantIdentity, data.trackId);
 				cryptor.setHasFrameMetadata(data.hasPacketTrailer);
 				cryptor.setupTransform(kind, data.readableStream, data.writableStream, data.trackId, data.codec);
 				break;
 			}
 			case 'encode': {
+				if (daveMode) {
+					const send = await getDaveSendCryptor(data.participantIdentity);
+					data.readableStream
+						.pipeThrough(createDaveEncodeTransform(send))
+						.pipeTo(data.writableStream)
+						.catch((e) => workerLogger.warn('dave encode transform error', {error: e}));
+					break;
+				}
 				const pubCryptor = getTrackCryptor(data.participantIdentity, data.trackId);
 				pubCryptor.setHasFrameMetadata(data.hasPacketTrailer);
 				pubCryptor.setupTransform(
@@ -201,6 +259,25 @@ self.addEventListener('message', (ev) => {
 			case 'setSifTrailer':
 				handleSifTrailer(data.trailer);
 				break;
+			case 'daveSetRatchet': {
+				const send = await getDaveSendCryptor(data.participantIdentity);
+				send.setRatchet(data.ratchet);
+				const recv = await getDaveReceiveCryptor(data.participantIdentity);
+				if (data.ratchet) {
+					recv.transitionTo(data.ratchet);
+				}
+				break;
+			}
+			case 'davePassthrough': {
+				const recv = await getDaveReceiveCryptor(data.participantIdentity);
+				recv.setPassthrough(data.enabled);
+				break;
+			}
+			case 'daveAssignCodec': {
+				const send = await getDaveSendCryptor(data.participantIdentity);
+				send.assignSsrc(data.ssrc, data.codec);
+				break;
+			}
 			default:
 				break;
 		}

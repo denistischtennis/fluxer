@@ -174,19 +174,13 @@ build_and_dispatch_voice_server(
         <<"channel_id">> => integer_to_binary(ChId),
         <<"connection_id">> => ConnId
     },
-    VoiceServerUpdate =
-        case maps:get(e2ee_key, Reply, undefined) of
-            Key when is_binary(Key) ->
-                VoiceServerUpdate0#{<<"e2ee_key">> => Key};
-            _ ->
-                VoiceServerUpdate0
-        end,
-    HasE2EE = maps:is_key(<<"e2ee_key">>, VoiceServerUpdate),
+    DaveVersion = maps:get(dave_version, Reply, null),
+    VoiceServerUpdate = VoiceServerUpdate0#{<<"dave_version">> => DaveVersion},
     logger:info(
         "voice_server_update_dispatch:"
         " guild_id=~p channel_id=~p"
-        " connection_id=~p has_e2ee_key=~p",
-        [GId, ChId, ConnId, HasE2EE]
+        " connection_id=~p dave_version=~p",
+        [GId, ChId, ConnId, DaveVersion]
     ),
     dispatch_to_session(
         SessionPid,
@@ -369,19 +363,19 @@ join_reply_dispatches_voice_server_update_test() ->
     ?assertEqual(<<"42">>, maps:get(<<"guild_id">>, Payload)),
     ?assertEqual(<<"456">>, maps:get(<<"channel_id">>, Payload)),
     ?assertEqual(<<"conn-1">>, maps:get(<<"connection_id">>, Payload)),
-    ?assertNot(maps:is_key(<<"e2ee_key">>, Payload)).
+    ?assertEqual(null, maps:get(<<"dave_version">>, Payload)).
 
-join_reply_attaches_e2ee_key_test() ->
+join_reply_attaches_dave_version_test() ->
     Reply = #{
         success => true,
         token => <<"tok">>,
         endpoint => <<"wss://voice">>,
         connection_id => <<"conn-1">>,
-        e2ee_key => <<"secret">>
+        dave_version => 1
     },
     ok = handle_guild_reply_ok(Reply, test_voice_ctx(456), self()),
     Payload = receive_dispatch(voice_server_update),
-    ?assertEqual(<<"secret">>, maps:get(<<"e2ee_key">>, Payload)).
+    ?assertEqual(1, maps:get(<<"dave_version">>, Payload)).
 
 null_channel_falls_back_to_reply_voice_state_test() ->
     Reply = #{

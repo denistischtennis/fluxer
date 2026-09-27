@@ -11,6 +11,7 @@ services:
       DOCKER_HOST: unix:///var/run/docker.sock
       pnpm_config_store_dir: /home/vscode/.local/share/pnpm/store
       FLUXER_PUBLIC_PORT: "${FLUXER_DEV_PROXY_PORT:-8088}"
+      FLUXER_DAVE_SEED: "${FLUXER_DAVE_SEED:-Zmx1eGVyLWRldi1kYXZlLXNlZWQtMzJieXRlLWxvbmdi}"
       FLUXER_PUBLIC_URL: "http://localhost:${FLUXER_DEV_PROXY_PORT:-8088}"
       FLUXER_API_ENDPOINT: "http://localhost:${FLUXER_DEV_PROXY_PORT:-8088}/api"
       FLUXER_API_CLIENT_ENDPOINT: "http://localhost:${FLUXER_DEV_PROXY_PORT:-8088}/api"

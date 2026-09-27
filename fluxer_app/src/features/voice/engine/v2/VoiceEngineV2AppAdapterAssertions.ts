@@ -112,7 +112,7 @@ export interface VoiceServerUpdateLike {
 	readonly connection_id: string;
 	readonly guild_id?: string | null;
 	readonly channel_id?: string | null;
-	readonly e2ee_key?: string | null;
+	readonly dave_version?: number | null;
 }
 
 export function assertVoiceServerUpdateShape(raw: unknown, fieldName: string): asserts raw is VoiceServerUpdateLike {
@@ -127,8 +127,12 @@ export function assertVoiceServerUpdateShape(raw: unknown, fieldName: string): a
 	if (candidate.channel_id !== undefined && candidate.channel_id !== null) {
 		assert.equal(typeof candidate.channel_id, 'string', `${fieldName}.channel_id must be a string when provided`);
 	}
-	if (candidate.e2ee_key !== undefined && candidate.e2ee_key !== null) {
-		assert.equal(typeof candidate.e2ee_key, 'string', `${fieldName}.e2ee_key must be a string when provided`);
+	if (candidate.dave_version !== undefined && candidate.dave_version !== null) {
+		assert.equal(
+			typeof candidate.dave_version,
+			'number',
+			`${fieldName}.dave_version must be a number when provided`,
+		);
 	}
 }
 

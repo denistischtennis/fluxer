@@ -5,47 +5,6 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
-handle_dm_disconnect_clears_e2ee_key_when_channel_empty_test() ->
-    VoiceState = #{
-        <<"channel_id">> => <<"100">>,
-        <<"user_id">> => <<"10">>,
-        <<"session_id">> => <<"sess">>,
-        <<"e2ee_capable">> => true
-    },
-    VoiceStates = #{<<"conn-1">> => VoiceState},
-    {Key, StateWithKey} = guild_voice_e2ee:get_or_create_room_key_dm(100, #{
-        id => <<"sess">>,
-        session_pid => self(),
-        channels => #{},
-        dm_voice_states => VoiceStates
-    }),
-    {reply, #{success := true}, NewState} =
-        dm_voice_state:handle_dm_disconnect(<<"conn-1">>, 10, VoiceStates, StateWithKey),
-    {NextKey, _} = guild_voice_e2ee:get_or_create_room_key_dm(100, NewState),
-    ?assertNotEqual(Key, NextKey).
-
-disconnect_voice_user_keeps_dm_e2ee_key_until_channel_empty_test() ->
-    VS1 = #{
-        <<"channel_id">> => <<"100">>,
-        <<"user_id">> => <<"10">>,
-        <<"session_id">> => <<"sess-a">>,
-        <<"e2ee_capable">> => true
-    },
-    VS2 = #{
-        <<"channel_id">> => <<"100">>,
-        <<"user_id">> => <<"20">>,
-        <<"session_id">> => <<"sess-b">>,
-        <<"e2ee_capable">> => true
-    },
-    VoiceStates = #{<<"conn-1">> => VS1, <<"conn-2">> => VS2},
-    {Key, StateWithKey} = guild_voice_e2ee:get_or_create_room_key_dm(100, #{
-        dm_voice_states => VoiceStates
-    }),
-    {reply, #{success := true}, NewState} =
-        dm_voice_state:disconnect_voice_user(10, StateWithKey),
-    {NextKey, _} = guild_voice_e2ee:get_or_create_room_key_dm(100, NewState),
-    ?assertEqual(Key, NextKey).
-
 disconnect_removes_voice_state_count_for_null_channel_test() ->
     Before = maps:get(
         <<"total_voice_states">>, voice_state_counts_cache:get_local_counts(), 0

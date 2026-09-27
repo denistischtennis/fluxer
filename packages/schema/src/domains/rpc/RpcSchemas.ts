@@ -29,6 +29,19 @@ import {z} from 'zod';
 
 const RPC_USER_BATCH_MAX = 1000;
 
+// Base64-encoded opaque DAVE MLS wire bytes (key packages, proposals, commits, welcomes).
+const DaveBytesType = createStringType(1, 262144).refine(
+	(value) => {
+		try {
+			atob(value);
+			return true;
+		} catch {
+			return false;
+		}
+	},
+	{message: 'value must be valid base64'},
+);
+
 export const RpcGuildCollectionType = z.enum([
 	'guild',
 	'roles',
@@ -217,6 +230,38 @@ export const RpcRequest = z.discriminatedUnion('type', [
 		type: z
 			.literal('get_push_service_delivery_config')
 			.describe('Request type for fetching push service delivery configuration'),
+	}),
+	z.object({
+		type: z.literal('dave_sender_package').describe('Request type for fetching the deployment DAVE external sender package'),
+	}),
+	z.object({
+		type: z.literal('dave_validate_key_package').describe('Request type for validating a DAVE MLS key package against a claimed user'),
+		key_package_b64: DaveBytesType.describe('Base64-encoded MLS KeyPackage bytes'),
+		user_id: SnowflakeType.describe('User ID the key package is claimed to belong to'),
+	}),
+	z.object({
+		type: z.literal('dave_create_proposals').describe('Request type for creating signed DAVE external add/remove proposals'),
+		group_id: SnowflakeType.describe('DAVE group (voice channel) ID'),
+		epoch: z.number().int().min(0).describe('Current MLS epoch the proposals target'),
+		add_b64: z.array(DaveBytesType).max(RPC_USER_BATCH_MAX).optional().describe('Base64 MLS key packages to add'),
+		remove_indices: z.array(z.number().int().min(0)).max(RPC_USER_BATCH_MAX).optional().describe('Leaf indices to remove'),
+	}),
+	z.object({
+		type: z.literal('dave_parse_commit').describe('Request type for parsing a DAVE commit/welcome bundle and deriving the roster'),
+		group_id: SnowflakeType.describe('DAVE group (voice channel) ID'),
+		expected_epoch: z.number().int().min(0).describe('Epoch the commit is expected to advance from'),
+		committer_user_id: SnowflakeType.describe('User ID asserted as the committer by the gateway'),
+		commit_welcome_b64: DaveBytesType.describe('Base64 commit(+welcome) bundle from the client'),
+		pending_proposals_b64: DaveBytesType.describe('Base64 proposal bundle the DS previously issued for this transition'),
+		known_roster: z
+			.array(
+				z.object({
+					user_id: SnowflakeType.describe('Roster member user ID'),
+					leaf_index: z.number().int().min(0).describe('Roster member leaf index'),
+				}),
+			)
+			.max(RPC_USER_BATCH_MAX)
+			.describe('Pre-commit occupancy'),
 	}),
 ]);
 
@@ -532,6 +577,54 @@ export const RpcResponse = z.discriminatedUnion('type', [
 				config: PushServiceDeliveryConfigResponse.describe('Push service delivery configuration'),
 			})
 			.describe('Push service delivery config result'),
+	}),
+	z.object({
+		type: z.literal('dave_sender_package').describe('Response type for the DAVE external sender package'),
+		data: z
+			.object({
+				sender_package_b64: DaveBytesType.describe('Base64-encoded DAVE external sender package'),
+			})
+			.describe('DAVE sender package result'),
+	}),
+	z.object({
+		type: z.literal('dave_validate_key_package').describe('Response type for DAVE key package validation'),
+		data: z
+			.object({
+				valid: z.boolean().describe('Whether the key package is valid for the claimed user'),
+				reason: createStringType(0, 512).describe('Validation reason (empty when valid)'),
+			})
+			.describe('DAVE key package validation result'),
+	}),
+	z.object({
+		type: z.literal('dave_create_proposals').describe('Response type for DAVE proposal creation'),
+		data: z
+			.object({
+				proposals_b64: DaveBytesType.describe('Base64-encoded signed external proposals bundle'),
+			})
+			.describe('DAVE proposals result'),
+	}),
+	z.object({
+		type: z.literal('dave_parse_commit').describe('Response type for DAVE commit/welcome parsing'),
+		data: z
+			.object({
+				ok: z.boolean().describe('Whether the commit was accepted'),
+				reason: createStringType(0, 512).optional().describe('Rejection reason when not ok'),
+				new_epoch: z.number().int().min(0).optional().describe('Epoch after the commit'),
+				committer_user_id: SnowflakeType.optional().describe('Derived committer user ID'),
+				roster: z
+					.array(
+						z.object({
+							user_id: SnowflakeType.describe('Roster member user ID'),
+							leaf_index: z.number().int().min(0).describe('Roster member leaf index'),
+						}),
+					)
+					.max(RPC_USER_BATCH_MAX)
+					.optional()
+					.describe('Post-commit roster'),
+				commit_b64: DaveBytesType.optional().describe('Canonical commit bytes'),
+				welcome_b64: DaveBytesType.optional().describe('Welcome bytes when the bundle carried one'),
+			})
+			.describe('DAVE parse commit result'),
 	}),
 ]);
 

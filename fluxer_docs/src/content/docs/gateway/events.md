@@ -959,11 +959,11 @@ The session received or replaced its own voice grant. Delivered to the requestin
 | connection_id | string | The voice connection the grant covers |
 | channel_id | snowflake | The channel the grant covers |
 | guild_id?<sup>1</sup> | snowflake | The guild the channel belongs to |
-| e2ee_key?<sup>2</sup> | string | The key material the channel's end-to-end encryption uses |
+| dave_version?<sup>2</sup> | number | The DAVE protocol version negotiated for this voice connection |
 
 <sup>1</sup> Present for a guild voice channel and absent for a call, so a client reads the scope from this field
 
-<sup>2</sup> Present only when the channel is end-to-end encrypted
+<sup>2</sup> Sent on every voice grant. A value `>= 1` means the connection is DAVE-protected (end-to-end, MLS group per channel); `null` means it runs unprotected. Media frames are then keyed by the DAVE handshake on opcode `dave_protocol_message`, never by a key carried in this event.
 
 Fluxer uses LiveKit for voice media. There is no second voice websocket, no voice opcode set, and no UDP discovery step. A client opens a LiveKit connection to `endpoint`, presents `token` there, and speaks the LiveKit protocol from that point on. [Voice](/voice/) states the room naming, the participant identity, and the track sources a grant admits.
 

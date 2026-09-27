@@ -5,7 +5,7 @@
 
 -export([voice_state_update/2]).
 -export([get_voice_state/2]).
--export([get_voice_token/6]).
+-export([get_voice_token/7]).
 -export([disconnect_voice_user/2]).
 -export([broadcast_voice_state_update/3]).
 -export([join_or_create_call/5, join_or_create_call/6]).
@@ -64,10 +64,12 @@ get_voice_state(ConnectionId, State) ->
     VoiceStates = maps:get(dm_voice_states, State, #{}),
     maps:get(ConnectionId, VoiceStates, undefined).
 
--spec get_voice_token(integer(), integer(), binary(), pid(), term(), term()) -> ok | error.
-get_voice_token(ChannelId, UserId, SessionId, SessionPid, Latitude, Longitude) ->
+-spec get_voice_token(
+    integer(), integer(), binary(), pid(), term(), term(), non_neg_integer()
+) -> ok | error.
+get_voice_token(ChannelId, UserId, SessionId, SessionPid, Latitude, Longitude, DaveMaxVersion) ->
     dm_voice_token:get_voice_token(
-        ChannelId, UserId, SessionId, SessionPid, Latitude, Longitude
+        ChannelId, UserId, SessionId, SessionPid, Latitude, Longitude, DaveMaxVersion
     ).
 
 -spec disconnect_voice_user(integer(), dm_state()) -> {reply, map(), dm_state()}.

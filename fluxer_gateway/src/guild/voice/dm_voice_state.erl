@@ -8,8 +8,6 @@
 -export([normalize_session_id/1, resolve_effective_session_id/2]).
 -export([validate_dm_viewer_stream_keys/3]).
 -export([maybe_attach_voice_routing_metadata/3]).
--export([clear_dm_e2ee_room_key_if_channel_empty/3]).
--export([clear_dm_e2ee_room_keys_for_removed_voice_states/3]).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -41,14 +39,13 @@ do_dm_disconnect(ConnectionId, OldVoiceState, VoiceStates, State) ->
     NewVoiceStates = maps:remove(ConnectionId, VoiceStates),
     NewState0 = State#{dm_voice_states => NewVoiceStates},
     OldChannelId = maps:get(<<"channel_id">>, OldVoiceState, null),
-    NewState = clear_dm_e2ee_room_key_if_channel_empty(OldChannelId, NewVoiceStates, NewState0),
     DisconnectVS = OldVoiceState#{
         <<"channel_id">> => null, <<"connection_id">> => ConnectionId
     },
     SessionId = maps:get(id, State),
     leave_call_if_needed(OldChannelId, SessionId, ConnectionId, State),
-    broadcast_disconnect_if_needed(OldChannelId, DisconnectVS, NewState),
-    {reply, #{success => true}, NewState}.
+    broadcast_disconnect_if_needed(OldChannelId, DisconnectVS, NewState0),
+    {reply, #{success => true}, NewState0}.
 
 -spec leave_call_if_needed(term(), term(), binary(), dm_state()) -> ok.
 leave_call_if_needed(null, _SessionId, ConnectionId, _State) ->
@@ -128,10 +125,7 @@ do_disconnect_voice_user(UserVoiceStates, VoiceStates, State) ->
         VoiceStates,
         UserVoiceStates
     ),
-    NewState0 = State#{dm_voice_states => NewVoiceStates},
-    NewState = clear_dm_e2ee_room_keys_for_removed_voice_states(
-        UserVoiceStates, NewVoiceStates, NewState0
-    ),
+    NewState = State#{dm_voice_states => NewVoiceStates},
     maps:foreach(
         fun(ConnId, _VS) ->
             _ = voice_state_counts_cache:remove_connection(ConnId),
@@ -159,32 +153,6 @@ broadcast_user_disconnect(ConnId, VoiceState, NewState) ->
     ChannelId = maps:get(<<"channel_id">>, VoiceState, null),
     DisconnectVS = VoiceState#{<<"channel_id">> => null, <<"connection_id">> => ConnId},
     broadcast_disconnect_if_needed(ChannelId, DisconnectVS, NewState).
-
--spec clear_dm_e2ee_room_key_if_channel_empty(term(), voice_state_map(), dm_state()) ->
-    dm_state().
-clear_dm_e2ee_room_key_if_channel_empty(ChannelId, VoiceStates, State) ->
-    case guild_voice_connection_normalize:normalize_positive_snowflake(ChannelId) of
-        undefined ->
-            State;
-        ChannelIdInt ->
-            guild_voice_e2ee:forget_room_key_if_channel_empty_dm(
-                ChannelIdInt, VoiceStates, State
-            )
-    end.
-
--spec clear_dm_e2ee_room_keys_for_removed_voice_states(
-    voice_state_map(), voice_state_map(), dm_state()
-) -> dm_state().
-clear_dm_e2ee_room_keys_for_removed_voice_states(RemovedVS, NewVS, State) ->
-    maps:fold(
-        fun(_ConnId, VS, AccState) ->
-            clear_dm_e2ee_room_key_if_channel_empty(
-                maps:get(<<"channel_id">>, VS, null), NewVS, AccState
-            )
-        end,
-        State,
-        RemovedVS
-    ).
 
 -spec resolve_call_region(integer()) -> binary() | null.
 resolve_call_region(ChannelId) ->

@@ -18,12 +18,7 @@ import {
 	type VoiceConnectionSnapshot,
 } from '@app/features/voice/engine/VoiceConnectionStateMachine';
 import {VoiceConnectionThrottle} from '@app/features/voice/engine/VoiceConnectionThrottle';
-import {
-	createE2EEKeyProvider,
-	createE2EEWorker,
-	ownE2EEWorker,
-	releaseE2EEWorker,
-} from '@app/features/voice/engine/VoiceE2EEKeyProvider';
+import {createE2EEWorker, ownE2EEWorker, releaseE2EEWorker} from '@app/features/voice/engine/VoiceE2EEKeyProvider';
 import {getSharedVoiceAudioContext} from '@app/features/voice/engine/VoiceSharedAudioContext';
 import {selectLocalMediaPublicationsForConnectionRepublish} from '@app/features/voice/engine/VoiceTrackPublicationUtils';
 import {
@@ -50,7 +45,6 @@ import {
 	loadVideoDecoderExclusions,
 } from '@app/features/voice/utils/VideoDecoderCapabilities';
 import type {
-	ExternalE2EEKeyProvider,
 	LocalTrack,
 	Room,
 	RoomConnectOptions,
@@ -61,6 +55,8 @@ import {Room as LiveKitRoom, RoomEvent, Track} from 'livekit-client';
 import {makeObservable, observableRef} from 'mobx';
 import type {Subscription} from 'rxjs';
 import {timer} from 'rxjs';
+import {DaveClient, type DaveTransport, type DaveKeyRatchet, type DaveDownMessage} from '@fluxer/dave';
+import GatewayConnection from '@app/features/gateway/transport/GatewayConnection';
 
 const logger = new Logger('VoiceEngineV2AppConnectionHostAdapter');
 const VOICE_SERVER_TIMEOUT_MS = 5000;
@@ -72,7 +68,8 @@ export interface VoiceServerUpdateData {
 	connection_id: string;
 	guild_id?: string;
 	channel_id?: string;
-	e2ee_key?: string | null;
+	/** DAVE protocol version selected by the gateway coordinator (>=1 = encrypted). */
+	dave_version?: number | null;
 }
 
 export interface VoiceConnectionState {
@@ -155,11 +152,10 @@ function createRoomPublishDefaults(): RoomOptions['publishDefaults'] {
 }
 
 function createRoomOptions(
-	e2eeKey: string | null,
+	daveVersion: number | null,
 	subscriberVideoCodecExclusions: RoomOptions['subscriberVideoCodecExclusions'],
 ): {
 	roomOptions: RoomOptions;
-	e2eeKeyProvider: ExternalE2EEKeyProvider | null;
 	e2eeWorker: Worker | null;
 } {
 	const roomOptions: RoomOptions = {
@@ -170,21 +166,19 @@ function createRoomOptions(
 		subscriberVideoCodecExclusions,
 		h264HardwareProfiles: getH264HardwareProfilesSync()?.profiles,
 	};
-	let e2eeKeyProvider: ExternalE2EEKeyProvider | null = null;
 	let e2eeWorker: Worker | null = null;
-	if (e2eeKey) {
+	const daveEnabled = typeof daveVersion === 'number' && daveVersion >= 1;
+	if (daveEnabled) {
 		try {
-			e2eeKeyProvider = createE2EEKeyProvider();
 			e2eeWorker = createE2EEWorker();
-			roomOptions.e2ee = {keyProvider: e2eeKeyProvider, worker: e2eeWorker};
+			roomOptions.e2ee = {worker: e2eeWorker, mode: 'dave'} as RoomOptions['e2ee'];
 		} catch (error) {
-			logger.error('Failed to construct E2EE key provider/worker', error);
+			logger.error('Failed to construct DAVE E2EE worker', error);
 			e2eeWorker?.terminate();
-			e2eeKeyProvider = null;
 			e2eeWorker = null;
 		}
 	}
-	return {roomOptions, e2eeKeyProvider, e2eeWorker};
+	return {roomOptions, e2eeWorker};
 }
 
 function createRoomConnectOptions(): RoomConnectOptions {
@@ -205,6 +199,11 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	private hotSwapTimeoutSub: Subscription | null = null;
 	private isLocalDisconnecting = false;
 	private hotSwapOperationQueue: Array<HotSwapQueuedOperation> = [];
+	private daveClient: DaveClient | null = null;
+	// Callback installed by the join path to push ratchets into the room E2EE worker.
+	private daveRatchetSink: ((identity: string, ratchet: DaveKeyRatchet | null) => void) | null = null;
+	// DAVE protocol version negotiated for the current connection (null = not DAVE).
+	private activeDaveVersion: number | null = null;
 
 	constructor() {
 		super();
@@ -230,6 +229,38 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 
 	get connected(): boolean {
 		return this.connectionState.connected;
+	}
+
+	/** Register the active DAVE session client for the current connection. */
+	registerDaveClient(
+		client: VoiceEngineV2AppConnectionHostAdapter['daveClient'],
+		ratchetSink: VoiceEngineV2AppConnectionHostAdapter['daveRatchetSink'],
+	): void {
+		this.daveClient = client;
+		this.daveRatchetSink = ratchetSink;
+	}
+
+	/** Forward a gateway DAVE event to the active DaveClient and sync ratchets. */
+	routeDaveProtocolEvent(down: DaveDownMessage): void {
+		const client = this.daveClient;
+		if (client === null) {
+			return;
+		}
+		client.onEvent(down);
+		// After any event that may advance our own ratchet, push it to the worker.
+		const selfId = this.selfUserId();
+		if (selfId && this.daveRatchetSink) {
+			this.daveRatchetSink(selfId, client.getRatchet(selfId));
+		}
+	}
+
+	private selfUserId(): string | null {
+		return this.connectionState.room?.localParticipant?.identity ?? null;
+	}
+
+	/** True when the current connection negotiated DAVE (version >= 1). */
+	private isDaveEnabled(): boolean {
+		return this.activeDaveVersion !== null && this.activeDaveVersion >= 1;
 	}
 
 	get connecting(): boolean {
@@ -536,7 +567,8 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			});
 		});
 		this.throttle.setInFlightConnect(true);
-		const e2eeKey = raw.e2ee_key ?? null;
+		const daveVersion = raw.dave_version ?? null;
+		this.activeDaveVersion = daveVersion;
 		clearScreenShareDecodeFailures();
 		const subscriberVideoCodecExclusions = await getRoomVideoDecoderExclusions();
 		if (
@@ -547,7 +579,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			logger.warn('Aborting LiveKit room creation after codec probing because attempt is stale', {attemptId});
 			return;
 		}
-		const {roomOptions, e2eeKeyProvider, e2eeWorker} = createRoomOptions(e2eeKey, subscriberVideoCodecExclusions);
+		const {roomOptions, e2eeWorker} = createRoomOptions(daveVersion, subscriberVideoCodecExclusions);
 		const room = new LiveKitRoom(roomOptions);
 		ownE2EEWorker(room, e2eeWorker);
 		let roomClosed = false;
@@ -583,7 +615,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			const connectOptions = createRoomConnectOptions();
 			room
 				.connect(endpoint, token, connectOptions)
-				.then(() => {
+				.then(async () => {
 					this.disconnectPreviousRoom(previousRoom, shouldStopPreviousRoomTracks);
 					logger.info('LiveKit connection succeeded');
 					const connectionState = this.connectionState;
@@ -608,6 +640,9 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 					this.update(() => {
 						this.transitionConnection({type: 'connection.roomReady', room, attemptId});
 					});
+					if (this.isDaveEnabled()) {
+						await this.setupDaveForRoom(room, resolvedChannelId);
+					}
 				})
 				.catch((error) => {
 					closeRoom();
@@ -623,20 +658,19 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 					}
 				});
 		};
-		if (e2eeKey) {
-			if (!e2eeKeyProvider) {
-				failConnectBeforeRoomConnect('Cannot join E2EE voice channel because E2EE setup failed');
+		if (daveVersion !== null && daveVersion >= 1) {
+			if (!e2eeWorker) {
+				failConnectBeforeRoomConnect('Cannot join DAVE voice channel because E2EE worker setup failed');
 				return;
 			}
-			void e2eeKeyProvider
-				.setKey(e2eeKey)
-				.then(() => room.setE2EEEnabled(true))
+			void room
+				.setE2EEEnabled(true)
 				.then(() => {
 					connectRoom();
 				})
 				.catch((error) => {
 					failConnectBeforeRoomConnect(
-						'Cannot join E2EE voice channel because the E2EE key failed to initialize',
+						'Cannot join DAVE voice channel because E2EE enable failed',
 						error,
 					);
 				});
@@ -682,18 +716,17 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		const connectionId = raw.connection_id ?? null;
 		this.abortHotSwap();
 		const cachedExclusions = getVideoDecoderExclusionsSync();
-		const roomOptions: RoomOptions = {
-			adaptiveStream: false,
-			dynacast: true,
-			webAudioMix: createWebAudioMixOption(),
-			publishDefaults: createRoomPublishDefaults(),
-			subscriberVideoCodecExclusions: cachedExclusions && cachedExclusions.length > 0 ? cachedExclusions : undefined,
-		};
+		const {roomOptions, e2eeWorker} = createRoomOptions(
+			this.activeDaveVersion,
+			cachedExclusions && cachedExclusions.length > 0 ? cachedExclusions : undefined,
+		);
 		if (!this.isLatestConnectionAttempt(attemptId) || this.connectionState.room !== existingRoom) {
 			logger.warn('Region hot-swap: aborted before room creation because attempt is stale', {attemptId});
+			e2eeWorker?.terminate();
 			return;
 		}
 		const newRoom = new LiveKitRoom(roomOptions);
+		ownE2EEWorker(newRoom, e2eeWorker);
 		this.update(() => {
 			this.transitionConnection({type: 'hotSwap.start', pendingRoom: newRoom, previousRoom: existingRoom});
 		});
@@ -724,6 +757,9 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 					return;
 				}
 				logger.info('Region hot-swap: new room connected, republishing tracks');
+				if (this.isDaveEnabled()) {
+					await this.migrateDaveToRoom(newRoom);
+				}
 				try {
 					await this.republishLocalTracks(existingRoom, newRoom);
 				} catch (error) {
@@ -1169,9 +1205,88 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			}
 		});
 	}
+	/**
+	 * Instantiate a DaveClient for a freshly-connected room and wire its uplink
+	 * transport to the gateway DAVE opcode plus a ratchet sink into the room's
+	 * E2EE worker. No-op when the room has no local identity yet or DAVE is
+	 * already bound to this room.
+	 */
+	private async setupDaveForRoom(room: Room, channelId: string): Promise<void> {
+		const selfId = room.localParticipant?.identity;
+		if (!selfId) {
+			logger.warn('DAVE setup skipped: no local participant identity');
+			return;
+		}
+		try {
+			const {DaveModuleFactory} = await import('@fluxer/libdave/wasm');
+			const mod = await DaveModuleFactory();
+			const transport: DaveTransport = {
+				send: (msg) => {
+					GatewayConnection.sendDaveProtocolMessage({
+						channel_id: msg.channel_id,
+						guild_id: this.connectionState.guildId ?? undefined,
+						type: msg.type,
+						transition_id: msg.transition_id,
+						data: msg.data,
+					});
+				},
+			};
+			const client = new DaveClient({mod, selfUserId: selfId, channelId, transport});
+			this.registerDaveClient(client, (identity: string, ratchet: DaveKeyRatchet | null) => {
+				room.setParticipantRatchet(identity, ratchet);
+			});
+			logger.info('DAVE client bound to room', {selfId, channelId});
+		} catch (error) {
+			logger.error('Failed to initialize DAVE client', error);
+		}
+	}
+	/**
+	 * Region hot-swap: the DAVE session persists (same gateway channel), but the
+	 * LiveKit room and its E2EE worker are new. Re-point the ratchet sink at the
+	 * new room, enable E2EE there, and re-push every known ratchet so media keeps
+	 * flowing encrypted through the fresh worker.
+	 */
+	private async migrateDaveToRoom(newRoom: Room): Promise<void> {
+		const client = this.daveClient;
+		if (client === null) {
+			logger.warn('DAVE migration skipped: no active client');
+			return;
+		}
+		this.registerDaveClient(client, (identity: string, ratchet: DaveKeyRatchet | null) => {
+			newRoom.setParticipantRatchet(identity, ratchet);
+		});
+		try {
+			await newRoom.setE2EEEnabled(true);
+		} catch (error) {
+			logger.error('DAVE migration: failed to enable E2EE on new room', error);
+			return;
+		}
+		const selfId = this.selfUserId();
+		if (selfId) {
+			newRoom.setParticipantRatchet(selfId, client.getRatchet(selfId));
+		}
+		for (const peerId of client.getRecognizedUsers()) {
+			newRoom.setParticipantRatchet(peerId, client.getRatchet(peerId));
+		}
+		logger.info('DAVE ratchets migrated to new room', {selfId, peers: client.getRecognizedUsers().length});
+	}
+
+	private teardownDave(): void {
+		const client = this.daveClient;
+		if (client !== null) {
+			try {
+				client.destroy();
+			} catch (error) {
+				logger.warn('DAVE client destroy failed', error);
+			}
+		}
+		this.daveClient = null;
+		this.daveRatchetSink = null;
+	}
 
 	private disconnectPreviousRoom(previousRoom: Room | null, stopTracks = true): void {
 		if (!previousRoom) return;
+		this.teardownDave();
 		try {
 			if (previousRoom.state === 'connected') {
 				const tracksToStop = stopTracks ? [] : this.getPreviousRoomNonScreenShareTracks(previousRoom);
@@ -1224,6 +1339,8 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		const {room} = this.connectionState;
 		this.clearVoiceServerTimeout();
 		this.abortHotSwap();
+		this.teardownDave();
+		this.activeDaveVersion = null;
 		if (room) {
 			room.removeAllListeners();
 			room.disconnect();

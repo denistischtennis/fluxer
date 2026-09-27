@@ -80,6 +80,15 @@ class GatewayConnection {
 	private isFatalCrashInProgress: boolean = false;
 	private connectionInterrupted: boolean = false;
 	private connectionGraceTimer: number | null = null;
+	sendDaveProtocolMessage(payload: {
+		channel_id: string;
+		guild_id?: string | null;
+		type: string;
+		transition_id?: number;
+		data?: string;
+	}): boolean {
+		return this.socket?.sendDaveProtocolMessage(payload) ?? false;
+	}
 	private previousSessionId: string | null = null;
 
 	constructor() {

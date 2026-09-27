@@ -31,8 +31,8 @@ disconnect_all_voice_users_in_channel(#{channel_id := ChannelId}, State) ->
     ),
     case maps:size(ChannelVoiceStates) of
         0 ->
-            State2 = guild_voice_disconnect_broadcast:clear_e2ee_room_key_if_channel_idle(
-                ChannelId, voice_state_utils:voice_states(State1), State1
+            State2 = guild_voice_disconnect_broadcast:retire_voice_states(
+                [ChannelId], #{}, voice_state_utils:voice_states(State1), State1
             ),
             {reply, #{success => true, disconnected_count => 0}, State2};
         Count ->
@@ -50,8 +50,8 @@ do_disconnect_channel(ChannelId, ChannelVoiceStates, VoiceStates, Count, State) 
     NewState1 = guild_voice_disconnect_broadcast:clear_recently_disconnected_for_channel(
         ChannelId, NewState0
     ),
-    NewState = guild_voice_disconnect_broadcast:clear_e2ee_room_key_if_channel_idle(
-        ChannelId, NewVoiceStates, NewState1
+    NewState = guild_voice_disconnect_broadcast:retire_voice_states(
+        [ChannelId], ChannelVoiceStates, NewVoiceStates, NewState1
     ),
     voice_state_utils:broadcast_disconnects(ChannelVoiceStates, NewState),
     {reply, #{success => true, disconnected_count => Count}, NewState}.
@@ -70,8 +70,8 @@ disconnect_user_from_expected_channel(UserId, ExpectedChannelId, VoiceStates, St
                 guild_voice_disconnect_broadcast:clear_pending_voice_connections_for_user_channel(
                     UserId, ExpectedChannelId, State
                 ),
-            State1 = guild_voice_disconnect_broadcast:clear_e2ee_room_key_if_channel_idle(
-                ExpectedChannelId, VoiceStates, State0
+            State1 = guild_voice_disconnect_broadcast:retire_voice_states(
+                [ExpectedChannelId], #{}, VoiceStates, State0
             ),
             {reply,
                 #{success => true, ignored => true, reason => <<"not_in_expected_channel">>},
@@ -80,8 +80,8 @@ disconnect_user_from_expected_channel(UserId, ExpectedChannelId, VoiceStates, St
             ok = guild_voice_disconnect_broadcast:purge_count_cache(maps:keys(UserVoiceStates)),
             NewVoiceStates = voice_state_utils:drop_voice_states(UserVoiceStates, VoiceStates),
             NewState0 = State#{voice_states => NewVoiceStates},
-            NewState1 = guild_voice_disconnect_broadcast:clear_e2ee_room_keys_for_removed(
-                UserVoiceStates, NewVoiceStates, NewState0
+            NewState1 = guild_voice_disconnect_broadcast:retire_voice_states(
+                [ExpectedChannelId], UserVoiceStates, NewVoiceStates, NewState0
             ),
             NewState = guild_voice_disconnect_broadcast:cache_recently_disconnected(
                 UserVoiceStates, NewState1
@@ -125,8 +125,8 @@ check_and_disconnect_connection(
             ok = guild_voice_disconnect_broadcast:purge_count_cache([ConnId]),
             NewVoiceStates = maps:remove(ConnId, VoiceStates),
             NewState0 = State#{voice_states => NewVoiceStates},
-            NewState1 = guild_voice_disconnect_broadcast:clear_e2ee_room_key_if_channel_idle(
-                ExpectedChannelId, NewVoiceStates, NewState0
+            NewState1 = guild_voice_disconnect_broadcast:retire_voice_states(
+                [ExpectedChannelId], #{ConnId => VoiceState}, NewVoiceStates, NewState0
             ),
             NewState = guild_voice_disconnect_broadcast:cache_recently_disconnected(
                 #{ConnId => VoiceState}, NewState1

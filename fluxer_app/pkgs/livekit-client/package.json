@@ -13,6 +13,8 @@
 		"test": "vitest run"
 	},
 	"dependencies": {
+		"@fluxer/dave": "workspace:*",
+		"@fluxer/libdave": "workspace:*",
 		"@livekit/mutex": "1.1.1",
 		"@livekit/protocol": "1.51.0",
 		"events": "^3.3.0",

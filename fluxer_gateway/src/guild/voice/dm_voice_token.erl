@@ -3,7 +3,7 @@
 -module(dm_voice_token).
 -typing([eqwalizer]).
 
--export([get_dm_voice_token_and_create_state/1, get_voice_token/6]).
+-export([get_dm_voice_token_and_create_state/1, get_voice_token/7]).
 -export([join_or_create_call/5, join_or_create_call/6]).
 -export([maybe_spawn_join_call/6, dispatch_to_session/4]).
 
@@ -78,12 +78,61 @@ handle_dm_token_success(Data, Req) ->
         maps:get(<<"serverId">>, Data, undefined)
     ),
     NewState0 = store_and_broadcast(ConnectionId, ChannelId, VoiceState, State),
-    {NewState, E2EEKey} = maybe_get_e2ee_key(EffE2EE, ChannelId, NewState0),
-    VSUpdate = build_voice_server_update(Token, Endpoint, ChannelId, ConnectionId, E2EEKey),
-    SessionPid = maps:get(session_pid, State),
-    dispatch_to_session(SessionPid, voice_server_update, VSUpdate, null),
-    spawn_join_call(ChannelId, UserId, VoiceState, SessionId, SessionPid),
-    {reply, #{success => true, needs_token => false, connection_id => ConnectionId}, NewState}.
+    case negotiate_dm_dave(EffE2EE, ChannelId, UserId, Req) of
+        {ok, DaveVersion} ->
+            VSUpdate =
+                build_voice_server_update(
+                    Token, Endpoint, ChannelId, ConnectionId, DaveVersion
+                ),
+            SessionPid = maps:get(session_pid, State),
+            dispatch_to_session(SessionPid, voice_server_update, VSUpdate, null),
+            spawn_join_call(ChannelId, UserId, VoiceState, SessionId, SessionPid),
+            {reply, #{success => true, needs_token => false, connection_id => ConnectionId},
+                NewState0};
+        error ->
+            %% DAVE is enforced but the call process that owns the MLS room did not
+            %% answer. Refuse the grant instead of handing out a connection that
+            %% would silently run without end-to-end encryption.
+            logger:warning("dm_voice_dave_negotiation_failed_refusing_grant", #{
+                user_id => UserId, channel_id => ChannelId
+            }),
+            {reply, gateway_errors:error(voice_token_failed), NewState0}
+    end.
+
+%% The DM call's MLS room lives in the call gen_server; ask it to admit this
+%% participant and report the negotiated protocol version.
+-spec negotiate_dm_dave(boolean(), integer(), integer(), token_request()) ->
+    {ok, integer() | null} | error.
+negotiate_dm_dave(false, _ChannelId, _UserId, _Req) ->
+    {ok, null};
+negotiate_dm_dave(true, ChannelId, UserId, Req) ->
+    MaxVersion = maps:get(dave_max_version, Req, 0),
+    UserBin = integer_to_binary(UserId),
+    case call_manager:lookup(ChannelId) of
+        {ok, CallPid} ->
+            try gen_server:call(CallPid, {dave_negotiate, UserBin, MaxVersion}, 5000) of
+                {ok, Version} when is_integer(Version) ->
+                    {ok, Version};
+                {ok, null} ->
+                    {ok, null};
+                Other ->
+                    logger:warning("dm_voice_dave_unexpected_reply", #{
+                        channel_id => ChannelId, reply => Other
+                    }),
+                    error
+            catch
+                Class:Reason ->
+                    logger:warning("dm_voice_dave_call_failed", #{
+                        channel_id => ChannelId, class => Class, reason => Reason
+                    }),
+                    error
+            end;
+        Other ->
+            logger:warning("dm_voice_dave_no_call_process", #{
+                channel_id => ChannelId, lookup => Other
+            }),
+            error
+    end.
 
 -spec build_voice_state(token_request(), binary(), boolean()) -> voice_state().
 build_voice_state(Req, ConnectionId, EffE2EE) ->
@@ -114,31 +163,16 @@ store_and_broadcast(ConnectionId, ChannelId, VoiceState, State) ->
     dm_voice_ring:broadcast_voice_state_update(ChannelId, VoiceState, NewState),
     NewState.
 
--spec maybe_get_e2ee_key(boolean(), integer(), dm_state()) ->
-    {dm_state(), binary() | undefined}.
-maybe_get_e2ee_key(true, ChannelId, State) ->
-    {RoomKey, NextState} = guild_voice_e2ee:get_or_create_room_key_dm(ChannelId, State),
-    {NextState, RoomKey};
-maybe_get_e2ee_key(false, _ChannelId, State) ->
-    {State, undefined}.
-
 -spec build_voice_server_update(
-    binary(), binary(), integer(), binary(), binary() | undefined
+    binary(), binary(), integer(), binary(), integer() | null
 ) -> map().
-build_voice_server_update(Token, Endpoint, ChannelId, ConnectionId, undefined) ->
-    #{
-        <<"token">> => Token,
-        <<"endpoint">> => Endpoint,
-        <<"channel_id">> => integer_to_binary(ChannelId),
-        <<"connection_id">> => ConnectionId
-    };
-build_voice_server_update(Token, Endpoint, ChannelId, ConnectionId, E2EEKey) ->
+build_voice_server_update(Token, Endpoint, ChannelId, ConnectionId, DaveVersion) ->
     #{
         <<"token">> => Token,
         <<"endpoint">> => Endpoint,
         <<"channel_id">> => integer_to_binary(ChannelId),
         <<"connection_id">> => ConnectionId,
-        <<"e2ee_key">> => E2EEKey
+        <<"dave_version">> => DaveVersion
     }.
 
 -spec dispatch_to_session(pid(), atom(), term(), integer() | null) -> ok.
@@ -194,8 +228,12 @@ maybe_spawn_join_call(true, ChannelId, UserId, VoiceState, SessionId, State) whe
 maybe_spawn_join_call(true, _ChId, _UserId, _VS, _SessId, _State) ->
     ok.
 
--spec get_voice_token(integer(), integer(), binary(), pid(), term(), term()) -> ok | error.
-get_voice_token(ChannelId, UserId, _SessionId, SessionPid, Latitude, Longitude) ->
+-spec get_voice_token(
+    integer(), integer(), binary(), pid(), term(), term(), non_neg_integer()
+) -> ok | error.
+get_voice_token(
+    ChannelId, UserId, _SessionId, SessionPid, Latitude, Longitude, DaveMaxVersion
+) ->
     Req = voice_utils:build_voice_token_rpc_request(
         null, ChannelId, UserId, null, Latitude, Longitude
     ),
@@ -203,7 +241,7 @@ get_voice_token(ChannelId, UserId, _SessionId, SessionPid, Latitude, Longitude) 
     ReqWithRegion = voice_utils:add_rtc_region_to_request(Req, Region),
     case rpc_client:call(ReqWithRegion) of
         {ok, Data} ->
-            handle_get_voice_token_ok(Data, UserId, ChannelId, SessionPid);
+            handle_get_voice_token_ok(Data, UserId, ChannelId, SessionPid, DaveMaxVersion);
         {error, {rpc_error, _Status, Body}} ->
             handle_get_token_rpc_error(UserId, ChannelId, Body, SessionPid);
         {error, Reason} ->
@@ -228,8 +266,9 @@ handle_get_token_rpc_error(UserId, ChannelId, Body, SessionPid) ->
         end,
     error.
 
--spec handle_get_voice_token_ok(map(), integer(), integer(), pid()) -> ok.
-handle_get_voice_token_ok(Data, UserId, ChannelId, SessionPid) ->
+-spec handle_get_voice_token_ok(map(), integer(), integer(), pid(), non_neg_integer()) ->
+    ok | error.
+handle_get_voice_token_ok(Data, UserId, ChannelId, SessionPid, DaveMaxVersion) ->
     Token = maps:get(<<"token">>, Data),
     Endpoint = maps:get(<<"endpoint">>, Data),
     ConnectionId = maps:get(<<"connectionId">>, Data),
@@ -237,14 +276,27 @@ handle_get_voice_token_ok(Data, UserId, ChannelId, SessionPid) ->
         "dm_voice_get_voice_token_ok: user_id=~p channel_id=~p connection_id=~p endpoint=~p",
         [UserId, ChannelId, ConnectionId, Endpoint]
     ),
-    SessionPid !
-        {voice_server_update, #{
-            channel_id => integer_to_binary(ChannelId),
-            endpoint => Endpoint,
-            token => Token,
-            connection_id => ConnectionId
-        }},
-    ok.
+    EffE2EE =
+        session_init:dave_capable(DaveMaxVersion) andalso
+            guild_voice_e2ee:is_e2ee_enabled_for_dm(),
+    case negotiate_dm_dave(EffE2EE, ChannelId, UserId, #{dave_max_version => DaveMaxVersion}) of
+        {ok, DaveVersion} ->
+            SessionPid !
+                {voice_server_update, #{
+                    channel_id => integer_to_binary(ChannelId),
+                    endpoint => Endpoint,
+                    token => Token,
+                    connection_id => ConnectionId,
+                    dave_version => DaveVersion
+                }},
+            ok;
+        error ->
+            logger:warning("dm_voice_dave_negotiation_failed_refusing_grant", #{
+                user_id => UserId, channel_id => ChannelId
+            }),
+            SessionPid ! {voice_error, voice_token_failed},
+            error
+    end.
 
 -spec join_or_create_call(integer(), integer(), voice_state(), binary(), pid()) -> ok.
 join_or_create_call(ChannelId, UserId, VoiceState, SessionId, SessionPid) ->

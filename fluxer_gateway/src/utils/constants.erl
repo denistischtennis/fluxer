@@ -46,6 +46,7 @@ gateway_opcode(12) -> gateway_error;
 gateway_opcode(14) -> lazy_request;
 gateway_opcode(15) -> request_guild_counts;
 gateway_opcode(16) -> request_channel_member_counts;
+gateway_opcode(17) -> dave_protocol_message;
 gateway_opcode(_) -> unknown.
 
 -spec opcode_to_num(atom()) -> integer().
@@ -64,7 +65,8 @@ opcode_to_num(heartbeat_ack) -> 11;
 opcode_to_num(gateway_error) -> 12;
 opcode_to_num(lazy_request) -> 14;
 opcode_to_num(request_guild_counts) -> 15;
-opcode_to_num(request_channel_member_counts) -> 16.
+opcode_to_num(request_channel_member_counts) -> 16;
+opcode_to_num(dave_protocol_message) -> 17.
 
 -spec close_code_to_num(atom()) -> integer().
 close_code_to_num(unknown_error) -> 4000;

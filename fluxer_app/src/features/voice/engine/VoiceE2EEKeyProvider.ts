@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {ExternalE2EEKeyProvider, type Room} from 'livekit-client';
+import type {Room} from 'livekit-client';
 
 const roomE2EEWorkers = new WeakMap<Room, Worker>();
 
@@ -12,10 +12,6 @@ export function createE2EEWorker(): Worker {
 			name: 'livekit-e2ee-worker',
 		},
 	);
-}
-
-export function createE2EEKeyProvider(): ExternalE2EEKeyProvider {
-	return new ExternalE2EEKeyProvider();
 }
 
 export function ownE2EEWorker(room: Room, worker: Worker | null): void {

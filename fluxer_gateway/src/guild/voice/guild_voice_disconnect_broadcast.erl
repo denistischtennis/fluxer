@@ -1,4 +1,9 @@
 %% SPDX-License-Identifier: AGPL-3.0-or-later
+%%
+%% Disconnect bookkeeping for guild voice. Owns the recently-disconnected cache,
+%% pending-connection cleanup and the DAVE room lifecycle: participants that leave
+%% are driven out of their channel's MLS room, and rooms that go idle are dropped.
+%% The pre-DAVE shared-key storage that used to live here is gone.
 
 -module(guild_voice_disconnect_broadcast).
 -typing([eqwalizer]).
@@ -12,8 +17,7 @@
     clear_pending_voice_connections_for_user/3,
     clear_pending_voice_connections_for_user_channel/3,
     clear_pending_voice_connections_for_channel/2,
-    clear_e2ee_room_key_if_channel_idle/3,
-    clear_e2ee_room_keys_for_removed/3,
+    retire_voice_states/4,
     purge_count_cache/1
 ]).
 
@@ -82,32 +86,12 @@ clear_recently_disconnected_for_channel(ChannelId, State) ->
 -spec clear_pending_voice_connection(binary(), guild_state()) -> guild_state().
 clear_pending_voice_connection(ConnectionId, State) ->
     PendingConnections = maps:get(pending_voice_connections, State, #{}),
-    case maps:is_key(ConnectionId, PendingConnections) of
-        false ->
-            State;
-        true ->
-            PendingData = maps:get(ConnectionId, PendingConnections, #{}),
-            NewPending = maps:remove(ConnectionId, PendingConnections),
-            NewState = State#{pending_voice_connections => NewPending},
-            clear_e2ee_room_keys_for_removed_pending(
-                #{ConnectionId => PendingData},
-                voice_state_utils:voice_states(State),
-                NewPending,
-                NewState
-            )
-    end.
+    State#{pending_voice_connections => maps:remove(ConnectionId, PendingConnections)}.
 
 -spec clear_pending_voice_connections_for_user(integer(), binary() | undefined, guild_state()) ->
     guild_state().
 clear_pending_voice_connections_for_user(UserId, RequestSessionId, State) ->
     PendingConnections = maps:get(pending_voice_connections, State, #{}),
-    RemovedPending = maps:filter(
-        fun(_ConnId, PendingData) ->
-            maps:get(user_id, PendingData, undefined) =:= UserId andalso
-                pending_session_matches(PendingData, RequestSessionId)
-        end,
-        PendingConnections
-    ),
     FilteredPending = maps:filter(
         fun(_ConnId, PendingData) ->
             PendingUserId = maps:get(user_id, PendingData, undefined),
@@ -116,10 +100,7 @@ clear_pending_voice_connections_for_user(UserId, RequestSessionId, State) ->
         end,
         PendingConnections
     ),
-    NewState = State#{pending_voice_connections => FilteredPending},
-    clear_e2ee_room_keys_for_removed_pending(
-        RemovedPending, voice_state_utils:voice_states(State), FilteredPending, NewState
-    ).
+    State#{pending_voice_connections => FilteredPending}.
 
 -spec pending_session_matches(map(), binary() | undefined) -> boolean().
 pending_session_matches(_PendingData, undefined) ->
@@ -134,22 +115,13 @@ normalize_session_id(Value) -> voice_state_utils:normalize_session_id(Value).
     guild_state().
 clear_pending_voice_connections_for_user_channel(UserId, ChannelId, State) ->
     PendingConnections = maps:get(pending_voice_connections, State, #{}),
-    RemovedPending = maps:filter(
-        fun(_ConnId, PendingData) ->
-            pending_user_channel_matches(PendingData, UserId, ChannelId)
-        end,
-        PendingConnections
-    ),
     FilteredPending = maps:filter(
         fun(_ConnId, PendingData) ->
             not pending_user_channel_matches(PendingData, UserId, ChannelId)
         end,
         PendingConnections
     ),
-    NewState = State#{pending_voice_connections => FilteredPending},
-    clear_e2ee_room_keys_for_removed_pending(
-        RemovedPending, voice_state_utils:voice_states(State), FilteredPending, NewState
-    ).
+    State#{pending_voice_connections => FilteredPending}.
 
 -spec pending_user_channel_matches(map(), integer(), integer()) -> boolean().
 pending_user_channel_matches(PendingData, UserId, ChannelId) ->
@@ -165,59 +137,90 @@ clear_pending_voice_connections_for_channel(ChannelId, State) ->
         end,
         PendingConnections
     ),
-    NewState = State#{pending_voice_connections => FilteredPending},
-    clear_e2ee_room_key_if_channel_idle(
-        ChannelId, voice_state_utils:voice_states(State), NewState
-    ).
+    State#{pending_voice_connections => FilteredPending}.
 
--spec clear_e2ee_room_key_if_channel_idle(
-    integer() | undefined, voice_state_map(), guild_state()
-) -> guild_state().
-clear_e2ee_room_key_if_channel_idle(ChannelId, VoiceStates, State) when is_integer(ChannelId) ->
-    PendingConnections = maps:get(pending_voice_connections, State, #{}),
-    guild_voice_e2ee:forget_room_key_if_channel_idle_guild(
-        ChannelId, VoiceStates, PendingConnections, State
-    );
-clear_e2ee_room_key_if_channel_idle(_, _VoiceStates, State) ->
-    State.
+%% --------------------------------------------------------------------------
+%% DAVE room lifecycle.
+%% --------------------------------------------------------------------------
 
--spec clear_e2ee_room_keys_for_removed(voice_state_map(), voice_state_map(), guild_state()) ->
+%% Take disconnected participants out of their DAVE rooms: drive `member_left'
+%% per removed voice state so the MLS group commits the removal, then forget any
+%% of the affected channels' rooms that no longer has a live voice state or a
+%% pending join. Guarded so a DAVE error never affects disconnect bookkeeping.
+-spec retire_voice_states([integer()], voice_state_map(), voice_state_map(), guild_state()) ->
     guild_state().
-clear_e2ee_room_keys_for_removed(RemovedVoiceStates, NewVoiceStates, State) ->
-    maps:fold(
+retire_voice_states(Channels, RemovedVoiceStates, RemainingVoiceStates, State) ->
+    WithLeft = maps:fold(
         fun(_ConnId, VoiceState, AccState) ->
-            clear_e2ee_room_key_if_channel_idle(
-                voice_state_utils:voice_state_channel_id(VoiceState), NewVoiceStates, AccState
-            )
+            dave_member_left(VoiceState, AccState)
         end,
         State,
         RemovedVoiceStates
+    ),
+    lists:foldl(
+        fun(ChId, Acc) -> drop_dave_room_if_idle(ChId, RemainingVoiceStates, Acc) end,
+        WithLeft,
+        lists:usort(Channels)
     ).
 
--spec clear_e2ee_room_keys_for_removed_pending(
-    map(), voice_state_map(), map(), guild_state()
-) -> guild_state().
-clear_e2ee_room_keys_for_removed_pending(Removed, VS, Remaining, State) ->
-    maps:fold(
-        fun(_ConnId, PendingData, AccState) ->
-            clear_e2ee_room_key_for_removed_pending(
-                PendingData, VS, Remaining, AccState
-            )
-        end,
-        State,
-        Removed
-    ).
-
--spec clear_e2ee_room_key_for_removed_pending(map(), voice_state_map(), map(), guild_state()) ->
+%% Drop the channel's DAVE room once nothing is left that could participate:
+%% no live voice state and no pending join in that channel.
+-spec drop_dave_room_if_idle(integer() | undefined, voice_state_map(), guild_state()) ->
     guild_state().
-clear_e2ee_room_key_for_removed_pending(PendingData, VoiceStates, RemainingPending, AccState) ->
-    case maps:get(channel_id, PendingData, undefined) of
-        ChannelId when is_integer(ChannelId) ->
-            guild_voice_e2ee:forget_room_key_if_channel_idle_guild(
-                ChannelId, VoiceStates, RemainingPending, AccState
-            );
+drop_dave_room_if_idle(ChannelId, VoiceStates, State) when is_integer(ChannelId) ->
+    case channel_has_participants(ChannelId, VoiceStates, State) of
+        true ->
+            State;
+        false ->
+            ChIdBin = integer_to_binary(ChannelId),
+            Rooms = maps:get(dave_rooms, State, #{}),
+            State#{dave_rooms => maps:remove(ChIdBin, Rooms)}
+    end;
+drop_dave_room_if_idle(_ChannelId, _VoiceStates, State) ->
+    State.
+
+-spec channel_has_participants(integer(), voice_state_map(), guild_state()) -> boolean().
+channel_has_participants(ChannelId, VoiceStates, State) ->
+    HasLive = maps:fold(
+        fun(_ConnId, VoiceState, Acc) ->
+            Acc orelse voice_state_utils:voice_state_channel_id(VoiceState) =:= ChannelId
+        end,
+        false,
+        VoiceStates
+    ),
+    HasLive orelse
+        maps:fold(
+            fun(_ConnId, PendingData, Acc) ->
+                Acc orelse maps:get(channel_id, PendingData, undefined) =:= ChannelId
+            end,
+            false,
+            maps:get(pending_voice_connections, State, #{})
+        ).
+
+%% Additive to dave_rooms only; guarded so a DAVE error never affects the
+%% disconnect itself.
+dave_member_left(VoiceState, State) ->
+    ChId = voice_state_utils:voice_state_channel_id(VoiceState),
+    UserId = voice_state_utils:voice_state_user_id(VoiceState),
+    case {is_integer(ChId), is_integer(UserId)} of
+        {true, true} ->
+            ChIdBin = integer_to_binary(ChId),
+            UserBin = integer_to_binary(UserId),
+            Rooms = maps:get(dave_rooms, State, #{}),
+            case maps:get(ChIdBin, Rooms, undefined) of
+                undefined ->
+                    State;
+                RS ->
+                    Members = fun() -> maps:keys(maps:get(key_packages, RS, #{})) end,
+                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, RS, Members) of
+                        NewRS -> State#{dave_rooms => Rooms#{ChIdBin => NewRS}}
+                    catch
+                        _:_ ->
+                            State
+                    end
+            end;
         _ ->
-            AccState
+            State
     end.
 
 -spec purge_count_cache([binary()]) -> ok.

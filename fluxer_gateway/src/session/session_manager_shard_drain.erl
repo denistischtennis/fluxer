@@ -14,7 +14,7 @@
     validate_identify_sharding/3,
     check_identify_rate_limit/1,
     should_debounce_reactions/1,
-    extract_e2ee_capable/1,
+    extract_dave_max_version/1,
     fetch_rpc_data/2
 ]).
 
@@ -190,7 +190,8 @@ build_session_data(Data, IdentifyData, Version, SocketPid, SessionId, UserDataMa
         guilds => filter_guild_ids_for_identify(Data, IdentifyData),
         ready => build_ready_data_for_session(Data),
         bot => map_utils:get_safe(UserDataMap, <<"bot">>, false),
-        e2ee_capable => extract_e2ee_capable(Properties),
+        e2ee_capable => session_init:dave_capable(extract_dave_max_version(Properties)),
+        dave_max_version => extract_dave_max_version(Properties),
         ignored_events => term_detach:detach(IgnoredEvents),
         initial_guild_id => map_utils:get_safe(IdentifyData, initial_guild_id, undefined),
         shard => Shard,
@@ -310,11 +311,16 @@ should_debounce_reactions(IdentifyData) ->
             false
     end.
 
--spec extract_e2ee_capable(term()) -> boolean().
-extract_e2ee_capable(Properties) when is_map(Properties) ->
-    is_truthy(maps:get(<<"e2ee_capable">>, Properties, false));
-extract_e2ee_capable(_) ->
-    false.
+-spec extract_dave_max_version(term()) -> non_neg_integer().
+extract_dave_max_version(Properties) when is_map(Properties) ->
+    case maps:get(<<"dave_max_version">>, Properties, 0) of
+        N when is_integer(N), N >= 0 ->
+            N;
+        _ ->
+            0
+    end;
+extract_dave_max_version(_) ->
+    0.
 
 -spec fetch_rpc_data(map(), term()) -> {ok, map()} | {error, term()}.
 fetch_rpc_data(Request, PeerIP) ->

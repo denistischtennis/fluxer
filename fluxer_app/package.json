@@ -177,6 +177,8 @@
 		"@floating-ui/react-dom": "catalog:",
 		"@fluxer/constants": "workspace:*",
 		"@fluxer/date_utils": "workspace:*",
+		"@fluxer/dave": "workspace:*",
+		"@fluxer/libdave": "workspace:*",
 		"@fluxer/geo_utils": "workspace:*",
 		"@fluxer/instance_bootstrap": "workspace:*",
 		"@fluxer/limits": "workspace:*",

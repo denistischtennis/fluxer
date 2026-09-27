@@ -19,6 +19,7 @@ export interface InitMessage extends BaseMessage {
 	data: {
 		keyProviderOptions: KeyProviderOptions;
 		loglevel: LogLevel;
+		mode?: 'sharedkey' | 'dave';
 	};
 }
 
@@ -180,6 +181,33 @@ export interface SetLogLevelMessage extends BaseMessage {
 	};
 }
 
+export interface DaveSetRatchetMessage extends BaseMessage {
+	kind: 'daveSetRatchet';
+	data: {
+		participantIdentity: string;
+		ratchet: {cipherSuite: number; baseSecret: number[]} | null;
+		transitionExpiryMs?: number;
+	};
+}
+
+export interface DavePassthroughMessage extends BaseMessage {
+	kind: 'davePassthrough';
+	data: {
+		participantIdentity: string;
+		enabled: boolean;
+		transitionExpiryMs?: number;
+	};
+}
+
+export interface DaveAssignCodecMessage extends BaseMessage {
+	kind: 'daveAssignCodec';
+	data: {
+		participantIdentity: string;
+		ssrc: number;
+		codec: number;
+	};
+}
+
 export type E2EEWorkerMessage =
 	| InitMessage
 	| SetKeyMessage
@@ -199,7 +227,10 @@ export type E2EEWorkerMessage =
 	| EncryptDataResponseMessage
 	| PTMetadataFromE2EEMessage
 	| LogMessage
-	| SetLogLevelMessage;
+	| SetLogLevelMessage
+	| DaveSetRatchetMessage
+	| DavePassthroughMessage
+	| DaveAssignCodecMessage;
 
 export type KeySet = {material: CryptoKey; encryptionKey: CryptoKey};
 
@@ -224,8 +255,9 @@ export type KeyInfo = {
 };
 
 export type E2EEManagerOptions = {
-	keyProvider: BaseKeyProvider;
+	keyProvider?: BaseKeyProvider;
 	worker: Worker;
+	mode?: 'sharedkey' | 'dave';
 };
 
 export type E2EEOptions =

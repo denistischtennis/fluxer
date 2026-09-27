@@ -230,6 +230,7 @@ export interface APIConfig {
 		webhookUrl?: string;
 		url?: string;
 		internalUrl?: string;
+		daveSeed?: string;
 		defaultRegion?: {
 			id: string;
 			name: string;

@@ -1,0 +1,7 @@
+{
+	"extends": "../../tsconfigs/package.json",
+	"compilerOptions": {
+		"lib": ["es2022", "dom", "dom.iterable"]
+	},
+	"include": ["src/**/*"]
+}

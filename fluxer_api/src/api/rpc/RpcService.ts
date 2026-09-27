@@ -82,6 +82,7 @@ import {isUserAdult} from '@app/api/utils/AgeUtils';
 import {deriveDominantAvatarColor} from '@app/api/utils/AvatarColorUtils';
 import {calculateDistance, parseCoordinate} from '@app/api/utils/GeoUtils';
 import {lookupGeoip} from '@app/api/utils/IpUtils';
+import {DaveSignerService} from '@app/api/voice/dave/DaveSignerService';
 import type {VoiceAccessContext, VoiceAvailabilityService} from '@app/api/voice/VoiceAvailabilityService';
 import type {VoiceService} from '@app/api/voice/VoiceService';
 import type {IWebhookRepository} from '@app/api/webhook/IWebhookRepository';
@@ -259,6 +260,7 @@ export class RpcService {
 		private readonly instanceConfigRepository: InstanceConfigRepository,
 		private voiceService: VoiceService | null,
 		private voiceAvailabilityService: VoiceAvailabilityService | null,
+		private readonly daveSignerService: DaveSignerService | null = null,
 	) {
 		this.customStatusValidator = new CustomStatusValidator(
 			this.userRepository,
@@ -273,6 +275,13 @@ export class RpcService {
 			discriminatorService: this.discriminatorService,
 			paymentRepository: new PaymentRepository(),
 		});
+	}
+
+	private requireDaveSigner(): DaveSignerService {
+		if (this.daveSignerService === null || !this.daveSignerService.isEnabled()) {
+			throw new Error('DAVE signer service is not configured');
+		}
+		return this.daveSignerService;
 	}
 
 	private async ensurePersonalNotesChannel(user: User): Promise<void> {
@@ -650,6 +659,66 @@ export class RpcService {
 				return {
 					type: 'get_push_service_delivery_config',
 					data: {config},
+				};
+			}
+			case 'dave_sender_package': {
+				const senderPackageB64 = await this.requireDaveSigner().getExternalSenderPackageB64();
+				return {
+					type: 'dave_sender_package',
+					data: {sender_package_b64: senderPackageB64},
+				};
+			}
+			case 'dave_validate_key_package': {
+				const result = await this.requireDaveSigner().validateKeyPackage(
+					request.key_package_b64,
+					String(request.user_id),
+				);
+				return {
+					type: 'dave_validate_key_package',
+					data: {valid: result.valid, reason: result.reason},
+				};
+			}
+			case 'dave_create_proposals': {
+				const proposalsB64 = await this.requireDaveSigner().createProposals({
+					groupId: String(request.group_id),
+					epoch: request.epoch,
+					addKeyPackagesB64: request.add_b64 ?? [],
+					removeLeafIndices: request.remove_indices ?? [],
+				});
+				return {
+					type: 'dave_create_proposals',
+					data: {proposals_b64: proposalsB64},
+				};
+			}
+			case 'dave_parse_commit': {
+				const result = await this.requireDaveSigner().parseCommit({
+					groupId: String(request.group_id),
+					expectedEpoch: request.expected_epoch,
+					committerUserId: String(request.committer_user_id),
+					commitWelcomeB64: request.commit_welcome_b64,
+					pendingProposalsB64: request.pending_proposals_b64,
+					knownRoster: (request.known_roster ?? []).map((entry) => ({
+						userId: String(entry.user_id),
+						leafIndex: entry.leaf_index,
+					})),
+				});
+				return {
+					type: 'dave_parse_commit',
+					data: {
+						ok: result.ok,
+						reason: result.reason,
+						new_epoch: result.newEpoch,
+						committer_user_id:
+							result.committerUserId !== undefined && result.committerUserId.length > 0
+								? BigInt(result.committerUserId)
+								: undefined,
+						roster: result.roster?.map((entry) => ({
+							user_id: BigInt(entry.userId),
+							leaf_index: entry.leafIndex,
+						})),
+						commit_b64: result.commitB64,
+						welcome_b64: result.welcomeB64,
+					},
 				};
 			}
 			default: {

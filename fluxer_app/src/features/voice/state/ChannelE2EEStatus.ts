@@ -8,6 +8,10 @@ export type ChannelE2EEStatus = 'encrypted' | 'broken' | 'none';
 
 interface ChannelE2EEStatusOptions {
 	emptyChannelStatus?: Extract<ChannelE2EEStatus, 'encrypted' | 'none'>;
+	/** Whether our own DAVE MLS session for this channel is established. */
+	localDaveEstablished?: boolean;
+	/** Whether the pinned external-sender (TOFU) still matches the live one. */
+	tofuOk?: boolean;
 }
 
 type ChannelE2EEVoiceState = {
@@ -59,6 +63,14 @@ export function computeChannelE2EEStatus(
 	}
 	if (total === 0) return emptyChannelStatus;
 	if (capable === 0) return 'none';
+	// A TOFU pin mismatch always downgrades to broken regardless of capability.
+	if (options.tofuOk === false) return 'broken';
+	// In a DAVE-aware context, "encrypted" additionally requires our own session
+	// to be established; a fully-capable room we haven't joined yet is broken.
+	if (options.localDaveEstablished !== undefined) {
+		if (capable === total) return options.localDaveEstablished ? 'encrypted' : 'broken';
+		return 'broken';
+	}
 	if (capable === total) return 'encrypted';
 	return 'broken';
 }

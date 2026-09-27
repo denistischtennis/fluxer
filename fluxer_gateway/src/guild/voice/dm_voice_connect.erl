@@ -72,6 +72,7 @@ build_connect_request(
         is_mobile => maps:get(is_mobile, Opts),
         latitude => maps:get(latitude, Opts),
         longitude => maps:get(longitude, Opts),
+        dave_max_version => maps:get(dave_max_version, Opts, 0),
         e2ee_capable => maps:get(e2ee_capable, Opts),
         bot => maps:get(bot, Opts),
         voice_states => maps:get(dm_voice_states, State, #{}),
@@ -97,7 +98,10 @@ extract_request_opts(Request) ->
         viewer_stream_keys => maps:get(viewer_stream_keys, Request, undefined),
         latitude => maps:get(latitude, Request, null),
         longitude => maps:get(longitude, Request, null),
-        e2ee_capable => maps:get(e2ee_capable, Request, false),
+        %% Post-cutover: capability is derived from the negotiated DAVE version,
+        %% never from a bare client boolean.
+        dave_max_version => maps:get(dave_max_version, Request, 0),
+        e2ee_capable => session_init:dave_capable(maps:get(dave_max_version, Request, 0)),
         bot => maps:get(bot, Request, false)
     }.
 

@@ -38,7 +38,7 @@ build_guild_state(#{guild_pid := GuildPid} = State) ->
         pending_voice_connections => maps:get(pending_voice_connections, State, #{}),
         recently_disconnected_voice_states =>
             maps:get(recently_disconnected_voice_states, State, #{}),
-        e2ee_room_keys => maps:get(e2ee_room_keys, State, #{})
+        dave_rooms => maps:get(dave_rooms, State, #{})
     }.
 
 -spec apply_guild_state(map(), server_state()) -> server_state().
@@ -63,8 +63,8 @@ merge_guild_state(GuildState, State) ->
                 GuildState,
                 maps:get(recently_disconnected_voice_states, State, #{})
             ),
-        e2ee_room_keys =>
-            maps:get(e2ee_room_keys, GuildState, maps:get(e2ee_room_keys, State, #{}))
+        dave_rooms =>
+            maps:get(dave_rooms, GuildState, maps:get(dave_rooms, State, #{}))
     }.
 
 -spec local_voice_states_for_channel(binary(), server_state()) -> map().

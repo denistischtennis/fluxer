@@ -126,7 +126,10 @@ handle_session_down(Pid, #{sessions := Sessions, voice_states := VoiceStates} = 
         {ok, SessionId, UserId} ->
             NewSess = maps:remove(SessionId, Sessions),
             NewVS = maybe_remove_user_voice_state(UserId, NewSess, VoiceStates),
-            BaseState = State#{voice_states => NewVS, sessions => NewSess},
+            BaseState = call_dave:member_left(
+                integer_to_binary(UserId),
+                State#{voice_states => NewVS, sessions => NewSess}
+            ),
             CleanState = call_ringing:cancel_ringing_timers([UserId], BaseState),
             RingState = call_ringing:remove_users_from_ringing([UserId], CleanState),
             {UpdState, Dispatched} = call_ringing:maybe_dispatch_state_update(
@@ -182,9 +185,12 @@ do_disconnect_cleanup(
     NewPending = voice_pending_common:remove_pending_connection(
         ConnectionId, PendingConns
     ),
-    BaseState = State#{
-        voice_states => NewVS, sessions => NewSess, pending_connections => NewPending
-    },
+    BaseState = call_dave:member_left(
+        integer_to_binary(UserId),
+        State#{
+            voice_states => NewVS, sessions => NewSess, pending_connections => NewPending
+        }
+    ),
     CleanState = call_ringing:cancel_ringing_timers([UserId], BaseState),
     RingState = call_ringing:remove_users_from_ringing([UserId], CleanState),
     {UpdState, Dispatched} = call_ringing:maybe_dispatch_state_update(State, RingState),
@@ -198,7 +204,10 @@ handle_leave(SessionId, #{sessions := Sessions, voice_states := VoiceStates} = S
             demonitor(Ref, [flush]),
             NewSess = maps:remove(SessionId, Sessions),
             NewVS = maybe_remove_user_voice_state(UserId, NewSess, VoiceStates),
-            BaseState = State#{voice_states => NewVS, sessions => NewSess},
+            BaseState = call_dave:member_left(
+                integer_to_binary(UserId),
+                State#{voice_states => NewVS, sessions => NewSess}
+            ),
             CleanState = call_ringing:cancel_ringing_timers([UserId], BaseState),
             RingState = call_ringing:remove_users_from_ringing([UserId], CleanState),
             {UpdState, Dispatched} = call_ringing:maybe_dispatch_state_update(
@@ -266,59 +275,87 @@ maybe_spawn_region_switch(
         voice_states := VoiceStates,
         sessions := Sessions,
         channel_id := ChannelId
-    }
+    } = State
 ) ->
     maybe_spawn_region_switch_for_participants(
-        maps:size(VoiceStates) > 0, NewRegion, VoiceStates, Sessions, ChannelId
+        maps:size(VoiceStates) > 0,
+        NewRegion,
+        VoiceStates,
+        Sessions,
+        ChannelId,
+        dave_version_of(State)
     ).
 
+%% The call's negotiated DAVE version, so a reissued grant never silently drops
+%% the connection back to plaintext mid-call.
+-spec dave_version_of(map()) -> integer() | null.
+dave_version_of(State) ->
+    case call_dave:room(State) of
+        undefined -> null;
+        Room -> maps:get(version, Room, null)
+    end.
+
 -spec maybe_spawn_region_switch_for_participants(
-    boolean(), binary() | undefined | null, map(), map(), integer()
+    boolean(), binary() | undefined | null, map(), map(), integer(), integer() | null
 ) -> ok.
 maybe_spawn_region_switch_for_participants(
-    HasParticipants, NewRegion, VoiceStates, Sessions, ChannelId
+    HasParticipants, NewRegion, VoiceStates, Sessions, ChannelId, DaveVersion
 ) ->
     case HasParticipants andalso is_binary(NewRegion) of
         true ->
-            spawn_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId);
+            spawn_voice_server_updates(
+                NewRegion, VoiceStates, Sessions, ChannelId, DaveVersion
+            );
         false ->
             ok
     end.
 
--spec spawn_voice_server_updates(binary(), map(), map(), integer()) -> ok.
-spawn_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId) ->
+-spec spawn_voice_server_updates(binary(), map(), map(), integer(), integer() | null) -> ok.
+spawn_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId, DaveVersion) ->
     spawn(fun() ->
-        send_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId)
+        send_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId, DaveVersion)
     end),
     ok.
 
 -spec send_voice_server_updates(
-    binary() | undefined | null, map(), map(), integer()
+    binary() | undefined | null, map(), map(), integer(), integer() | null
 ) -> ok.
-send_voice_server_updates(NewRegion, _VS, _Sessions, _ChId) when not is_binary(NewRegion) ->
+send_voice_server_updates(NewRegion, _VS, _Sessions, _ChId, _DaveVersion) when
+    not is_binary(NewRegion)
+->
     ok;
-send_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId) ->
+send_voice_server_updates(NewRegion, VoiceStates, Sessions, ChannelId, DaveVersion) ->
     maps:foreach(
         fun(_SessionId, {UserId, SessionPid, _Ref}) ->
             maybe_send_voice_server_update(
-                UserId, SessionPid, NewRegion, ChannelId, VoiceStates
+                UserId, SessionPid, NewRegion, ChannelId, VoiceStates, DaveVersion
             )
         end,
         Sessions
     ),
     ok.
 
--spec maybe_send_voice_server_update(integer(), pid(), binary(), integer(), map()) -> ok.
-maybe_send_voice_server_update(UserId, SessionPid, NewRegion, ChannelId, VoiceStates) ->
+-spec maybe_send_voice_server_update(
+    integer(), pid(), binary(), integer(), map(), integer() | null
+) -> ok.
+maybe_send_voice_server_update(
+    UserId, SessionPid, NewRegion, ChannelId, VoiceStates, DaveVersion
+) ->
     case maps:get(UserId, VoiceStates, undefined) of
         undefined ->
             ok;
         VoiceState ->
-            send_voice_server_update(ChannelId, UserId, SessionPid, NewRegion, VoiceState)
+            send_voice_server_update(
+                ChannelId, UserId, SessionPid, NewRegion, VoiceState, DaveVersion
+            )
     end.
 
--spec send_voice_server_update(integer(), integer(), pid(), binary(), map()) -> ok.
-send_voice_server_update(ChannelId, UserId, SessionPid, NewRegion, VoiceState) ->
+-spec send_voice_server_update(
+    integer(), integer(), pid(), binary(), map(), integer() | null
+) -> ok.
+send_voice_server_update(
+    ChannelId, UserId, SessionPid, NewRegion, VoiceState, DaveVersion
+) ->
     ConnectionId = maps:get(<<"connection_id">>, VoiceState, null),
     case ConnectionId of
         undefined ->
@@ -330,7 +367,7 @@ send_voice_server_update(ChannelId, UserId, SessionPid, NewRegion, VoiceState) -
                 null, ChannelId, UserId, ConnectionId, null, null
             ),
             Req = voice_utils:add_rtc_region_to_request(Req0, rpc_region(NewRegion)),
-            dispatch_voice_server_rpc(ChannelId, SessionPid, Req)
+            dispatch_voice_server_rpc(ChannelId, SessionPid, Req, DaveVersion)
     end.
 
 -spec rpc_region(binary()) -> binary() | null.
@@ -339,8 +376,8 @@ rpc_region(<<"automatic">>) ->
 rpc_region(NewRegion) ->
     NewRegion.
 
--spec dispatch_voice_server_rpc(integer(), pid(), map()) -> ok.
-dispatch_voice_server_rpc(ChannelId, SessionPid, Req) ->
+-spec dispatch_voice_server_rpc(integer(), pid(), map(), integer() | null) -> ok.
+dispatch_voice_server_rpc(ChannelId, SessionPid, Req, DaveVersion) ->
     case rpc_client:call(Req) of
         {ok,
             #{
@@ -352,7 +389,8 @@ dispatch_voice_server_rpc(ChannelId, SessionPid, Req) ->
                 <<"token">> => Token,
                 <<"endpoint">> => Endpoint,
                 <<"channel_id">> => integer_to_binary(ChannelId),
-                <<"connection_id">> => ConnId
+                <<"connection_id">> => ConnId,
+                <<"dave_version">> => DaveVersion
             },
             gateway_dispatch_relay:dispatch(
                 SessionPid, voice_server_update, VoiceServerUpdate, 0

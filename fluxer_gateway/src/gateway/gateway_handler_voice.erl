@@ -5,6 +5,7 @@
 
 -export([
     handle_voice_state_update/3,
+    handle_dave_protocol_message/3,
     process_queued_voice_updates/1,
     ensure_voice_queue_timer/1,
     enqueue_voice_update/2,
@@ -33,6 +34,23 @@ handle_voice_state_update(Pid, Data, State) ->
             log_voice_update(Pid, Data, queued),
             queue_voice_update(Pid, Data),
             {ok, ensure_voice_queue_timer(State)}
+    end.
+
+%% @doc Inbound `dave_protocol_message' (opcode 17). Routed straight to the
+%% session's guild voice server; never queued (low rate, latency-sensitive).
+-spec handle_dave_protocol_message(pid(), map(), state()) -> ws_result().
+handle_dave_protocol_message(Pid, Data, State) ->
+    try gen_server:call(Pid, {dave_protocol_message, Data}, 5000) of
+        _ -> {ok, State}
+    catch
+        Class:Reason ->
+            logger:warning("Gateway dave protocol message call failed", #{
+                session_pid => Pid,
+                class => Class,
+                reason => Reason,
+                channel_id => maps:get(<<"channel_id">>, Data, undefined)
+            }),
+            {ok, State}
     end.
 
 -spec log_voice_update(pid(), map(), direct | queued) -> ok.

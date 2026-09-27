@@ -360,6 +360,7 @@ export function buildAPIConfigFromMaster(master: MasterConfig): APIConfig {
 			webhookUrl: master.integrations.voice.webhook_url,
 			url: master.integrations.voice.url,
 			internalUrl: master.integrations.voice.internal_url,
+			daveSeed: (master.services.api.dave_seed ?? '').trim(),
 			defaultRegion: master.integrations.voice.default_region,
 		},
 		stripe: {

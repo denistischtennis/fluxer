@@ -20,12 +20,15 @@ import type {TrackPublication} from '../room/track/TrackPublication.ts';
 import {mimeTypeToVideoCodecString} from '../room/track/utils.ts';
 import {Future, isLocalTrack, isSafariBased, isScriptTransformSupportedForWorker, isVideoTrack} from '../room/utils.ts';
 import type {NonSharedUint8Array} from '../type-polyfills/non-shared-typed-arrays.ts';
-import {E2EE_FLAG, E2EE_TRACK_ID} from './constants.ts';
+import {E2EE_FLAG, E2EE_TRACK_ID, KEY_PROVIDER_DEFAULTS} from './constants.ts';
 import {CryptorError, CryptorErrorReason} from './errors.ts';
 import {type E2EEManagerCallbacks, EncryptionEvent, KeyProviderEvent} from './events.ts';
 import type {BaseKeyProvider} from './KeyProvider.ts';
 import type {
 	DecryptDataRequestMessage,
+	DaveAssignCodecMessage,
+	DavePassthroughMessage,
+	DaveSetRatchetMessage,
 	DecryptDataResponseMessage,
 	E2EEManagerOptions,
 	E2EEWorkerMessage,
@@ -61,6 +64,16 @@ export interface BaseE2EEManager {
 	): Promise<DecryptDataResponseMessage['data']>;
 	on<E extends keyof E2EEManagerCallbacks>(event: E, listener: E2EEManagerCallbacks[E]): this;
 	dispose?(): void;
+	/** DAVE: push a peer/self key ratchet into the worker (null clears). */
+	setParticipantRatchet(
+		participantIdentity: string,
+		ratchet: {cipherSuite: number; baseSecret: number[]} | null,
+		transitionExpiryMs?: number,
+	): void;
+	/** DAVE: toggle passthrough for a participant (version-0 / pre-transition). */
+	setParticipantPassthrough(participantIdentity: string, enabled: boolean, transitionExpiryMs?: number): void;
+	/** DAVE: map an outbound track's synthetic SSRC to its codec. */
+	assignTrackCodec(participantIdentity: string, ssrc: number, codec: number): void;
 }
 
 export class E2EEManager
@@ -73,7 +86,9 @@ export class E2EEManager
 
 	private encryptionEnabled: boolean;
 
-	private keyProvider: BaseKeyProvider;
+	private keyProvider: BaseKeyProvider | undefined;
+
+	private mode: 'sharedkey' | 'dave';
 
 	private decryptDataRequests: Map<string, Future<DecryptDataResponseMessage['data'], Error>> = new Map();
 
@@ -102,6 +117,7 @@ export class E2EEManager
 	constructor(options: E2EEManagerOptions, dcEncryptionEnabled: boolean) {
 		super();
 		this.keyProvider = options.keyProvider;
+		this.mode = options.mode ?? 'sharedkey';
 		this.worker = options.worker;
 		this.encryptionEnabled = false;
 		this.dataChannelEncryptionEnabled = dcEncryptionEnabled;
@@ -122,12 +138,16 @@ export class E2EEManager
 		this.log.info('setting up e2ee');
 		if (room !== this.room) {
 			this.room = room;
-			this.setupEventListeners(room, this.keyProvider);
+			const isDave = this.mode === 'dave';
+			if (!isDave && this.keyProvider) {
+				this.setupEventListeners(room, this.keyProvider);
+			}
 			const msg: InitMessage = {
 				kind: 'init',
 				data: {
-					keyProviderOptions: this.keyProvider.getOptions(),
+					keyProviderOptions: isDave ? KEY_PROVIDER_DEFAULTS : this.keyProvider!.getOptions(),
 					loglevel: workerLogger.getLevel() as LogLevel,
+					mode: this.mode,
 				},
 			};
 			if (this.worker) {
@@ -221,7 +241,7 @@ export class E2EEManager
 				break;
 			case 'initAck':
 				if (data.enabled) {
-					this.keyProvider.getKeys().forEach((keyInfo) => {
+					this.keyProvider?.getKeys().forEach((keyInfo) => {
 						this.postKey(keyInfo, false);
 					});
 				}
@@ -229,7 +249,7 @@ export class E2EEManager
 
 			case 'enable':
 				if (data.enabled) {
-					this.keyProvider.getKeys().forEach((keyInfo) => {
+					this.keyProvider?.getKeys().forEach((keyInfo) => {
 						this.postKey(keyInfo, false);
 					});
 				}
@@ -248,7 +268,7 @@ export class E2EEManager
 				}
 				break;
 			case 'ratchetKey':
-				this.keyProvider.emit(
+				this.keyProvider?.emit(
 					KeyProviderEvent.KeyRatcheted,
 					data.ratchetResult,
 					data.participantIdentity,
@@ -380,6 +400,43 @@ export class E2EEManager
 			.on(KeyProviderEvent.RatchetRequest, (participantId, keyIndex) =>
 				this.postRatchetRequest(participantId, keyIndex),
 			);
+	}
+	/**
+	 * Push a peer's (or self's) DAVE key ratchet into the worker. Called by the
+	 * app whenever a new epoch ratchet is produced by the DaveClient session.
+	 */
+	setParticipantRatchet(
+		participantIdentity: string,
+		ratchet: {cipherSuite: number; baseSecret: number[]} | null,
+		transitionExpiryMs?: number,
+	): void {
+		const msg: DaveSetRatchetMessage = {
+			kind: 'daveSetRatchet',
+			data: {participantIdentity, ratchet, transitionExpiryMs},
+		};
+		this.worker?.postMessage(msg);
+	}
+
+	/** Enable/disable passthrough for a participant (version-0 / pre-transition). */
+	setParticipantPassthrough(
+		participantIdentity: string,
+		enabled: boolean,
+		transitionExpiryMs?: number,
+	): void {
+		const msg: DavePassthroughMessage = {
+			kind: 'davePassthrough',
+			data: {participantIdentity, enabled, transitionExpiryMs},
+		};
+		this.worker?.postMessage(msg);
+	}
+
+	/** Map an outbound track's synthetic SSRC to its DAVE codec. */
+	assignTrackCodec(participantIdentity: string, ssrc: number, codec: number): void {
+		const msg: DaveAssignCodecMessage = {
+			kind: 'daveAssignCodec',
+			data: {participantIdentity, ssrc, codec},
+		};
+		this.worker?.postMessage(msg);
 	}
 
 	async encryptData(data: NonSharedUint8Array): Promise<EncryptDataResponseMessage['data']> {

@@ -1,0 +1,29 @@
+@fluxer/libdave — vendored DAVE protocol library
+===============================================
+
+Source: https://github.com/discord/libdave (MIT License)
+Snapshot: `C:/Users/Main/Desktop/libdave-main` (upstream `main`, vendored 2026-09-26).
+
+This package contains modified copies of upstream libdave sources:
+
+- `cpp/` — full C++ core (MLS session, key ratchets, frame cryptors, WASM bindings).
+  Modifications (see VENDORING.md for details):
+  * `CMakeLists.txt`: added `DAVE_DELIVERY` option and `DAVE_ENVIRONMENT` cache
+    variable so one source tree produces both browser and node WASM artefacts.
+  * `src/bindings_wasm_delivery.cpp`: new file, fluxer-authored delivery-service
+    bindings (external sender credentials, key-package validation, external
+    proposals, commit parsing). Not upstream code; same MIT licence applies to the
+    surrounding work.
+- `js/` — fingerprint/displayable-code helpers copied from upstream `js/src/`
+  (tests converted from Jest to Vitest; otherwise unchanged).
+
+Third-party dependencies pulled in at build time (not vendored here):
+
+- cisco/mlspp @ 1cc50a124a3bc4e143a787ec934280dc70c1034d (MIT), built via the
+  bundled vcpkg overlay port with `-DMLS_CXX_NAMESPACE="mlspp" -DDISABLE_GREASE=ON`.
+- OpenSSL 3.x (Apache-2.0 / OpenSSL+SSLeay dual licence) via vcpkg.
+- nlohmann-json (MIT) via vcpkg.
+- @noble/hashes 1.5.0, base64-js 1.5.1 (MIT) for the JS helpers.
+
+The upstream LICENSE (MIT) ships alongside as ./LICENSE and covers all upstream
+code in this package.

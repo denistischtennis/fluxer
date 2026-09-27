@@ -30,7 +30,9 @@
     | {leave, binary()}
     | {update_voice_state, integer(), map()}
     | {get_sessions}
-    | {get_pending_connections}.
+    | {get_pending_connections}
+    | {dave_negotiate, binary(), non_neg_integer()}
+    | {dave_message, binary(), map()}.
 -type cast_request() ::
     {join_async, integer(), map(), binary(), pid()}
     | {set_caller, map()}.
@@ -147,6 +149,11 @@ handle_call_request({update_voice_state, UserId, VoiceState}, State) ->
     handle_update_voice_state(UserId, VoiceState, State);
 handle_call_request({get_sessions}, State) ->
     handle_get_sessions(State);
+handle_call_request({dave_negotiate, UserBin, MaxVersion}, State) ->
+    {Version, NewState} = call_dave:negotiate_join(UserBin, MaxVersion, State),
+    {reply, {ok, Version}, NewState};
+handle_call_request({dave_message, SenderBin, Raw}, State) ->
+    {reply, ok, call_dave:handle_message(Raw, SenderBin, State)};
 handle_call_request({get_pending_connections}, State) ->
     handle_get_pending_connections(State).
 
@@ -285,6 +292,14 @@ decode_session_call_request({get_sessions}) ->
     {ok, {get_sessions}};
 decode_session_call_request({get_pending_connections}) ->
     {ok, {get_pending_connections}};
+decode_session_call_request({dave_negotiate, UserBin, MaxVersion}) when
+    is_binary(UserBin), is_integer(MaxVersion), MaxVersion >= 0
+->
+    {ok, {dave_negotiate, UserBin, MaxVersion}};
+decode_session_call_request({dave_message, SenderBin, Raw}) when
+    is_binary(SenderBin), is_map(Raw)
+->
+    {ok, {dave_message, SenderBin, Raw}};
 decode_session_call_request(_) ->
     error.
 

@@ -17,6 +17,7 @@ import {
 import {SsoService} from '@app/api/auth/services/SsoService';
 import type {IBlueskyOAuthService} from '@app/api/bluesky/IBlueskyOAuthService';
 import {Config} from '@app/api/Config';
+import {DaveSignerService} from '@app/api/voice/dave/DaveSignerService';
 import {createApiContext} from '@app/api/CreateApiContext';
 import {ChannelRepository} from '@app/api/channel/ChannelRepository';
 import {ChannelRequestService} from '@app/api/channel/services/ChannelRequestService';
@@ -364,6 +365,7 @@ class RequestServices implements RequestScopedServices {
 	private cachedLiveKit: ILiveKitService | undefined;
 	private cachedVoiceRooms: IVoiceRoomStore | undefined;
 	private cachedVoice: VoiceService | null | undefined;
+	private cachedDaveSigner: DaveSignerService | null | undefined;
 	private cachedGuildStack: GuildStackServices | undefined;
 	private cachedChannelRepository: ChannelRepository | undefined;
 	private cachedGuildRepository: GuildRepository | undefined;
@@ -456,6 +458,28 @@ class RequestServices implements RequestScopedServices {
 					: null;
 		}
 		return this.cachedVoice;
+	}
+
+	private get daveSignerService(): DaveSignerService | null {
+		if (this.cachedDaveSigner === undefined) {
+			const seed = (Config.voice.daveSeed ?? '').trim();
+			if (seed.length === 0) {
+				this.cachedDaveSigner = null;
+			} else {
+				// Accept either base64 (preferred) or raw UTF-8 secret as the seed.
+				let bytes: Uint8Array;
+				try {
+					bytes = new Uint8Array(Buffer.from(seed, 'base64'));
+					if (bytes.length < 16) {
+						bytes = new Uint8Array(Buffer.from(seed, 'utf8'));
+					}
+				} catch {
+					bytes = new Uint8Array(Buffer.from(seed, 'utf8'));
+				}
+				this.cachedDaveSigner = new DaveSignerService(bytes);
+			}
+		}
+		return this.cachedDaveSigner;
 	}
 
 	private get guildStack(): GuildStackServices {
@@ -891,6 +915,7 @@ class RequestServices implements RequestScopedServices {
 			getInstanceConfigRepository(),
 			this.voice,
 			getVoiceAvailabilityService(),
+			this.daveSignerService,
 		);
 		return this.cachedRpcService;
 	}

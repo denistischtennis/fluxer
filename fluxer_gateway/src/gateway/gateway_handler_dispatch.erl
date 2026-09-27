@@ -63,6 +63,10 @@ handle_authenticated_opcode(voice_state_update, Data, #{session_pid := Pid} = St
     is_pid(Pid), is_map(Data)
 ->
     gateway_handler_voice:handle_voice_state_update(Pid, Data, State);
+handle_authenticated_opcode(dave_protocol_message, Data, #{session_pid := Pid} = State) when
+    is_pid(Pid), is_map(Data)
+->
+    gateway_handler_voice:handle_dave_protocol_message(Pid, Data, State);
 handle_authenticated_opcode(voice_state_update, _Data, State) ->
     gateway_handler_encode:close_with_reason(
         decode_error, <<"Invalid voice payload">>, State

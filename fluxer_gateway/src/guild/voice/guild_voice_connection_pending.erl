@@ -12,7 +12,6 @@
     maybe_restore_pending_connection/5,
     resolve_voice_state_from_pending/4,
     sweep_expired_pending_joins/1,
-    clear_e2ee_room_key_if_channel_idle/3,
     validate_pending_nonce_and_expiry/2
 ]).
 
@@ -78,18 +77,7 @@ sweep_expired_pending_joins(State) ->
     spawn_force_disconnects(Expired),
     StateCleared = clear_expired_virtual_flags(Expired, State),
     StateWithPending = StateCleared#{pending_voice_connections => Remaining},
-    clear_expired_e2ee_keys(Expired, StateWithPending, Remaining).
-
--spec clear_e2ee_room_key_if_channel_idle(
-    integer() | undefined, voice_state_map(), guild_state()
-) -> guild_state().
-clear_e2ee_room_key_if_channel_idle(ChannelId, VoiceStates, State) when is_integer(ChannelId) ->
-    PendingConnections = pending_voice_connections(State),
-    guild_voice_e2ee:forget_room_key_if_channel_idle_guild(
-        ChannelId, VoiceStates, PendingConnections, State
-    );
-clear_e2ee_room_key_if_channel_idle(_, _VoiceStates, State) ->
-    State.
+    retire_expired_dave_rooms(Expired, StateWithPending).
 
 -spec validate_pending_nonce_and_expiry(binary() | undefined, map()) -> ok | {error, atom()}.
 validate_pending_nonce_and_expiry(TokenNonce, PendingData) ->
@@ -401,30 +389,21 @@ clear_single_virtual_flags({_ConnId, Metadata}, AccState) ->
             AccState
     end.
 
--spec clear_expired_e2ee_keys([{binary(), map()}], guild_state(), pending_voice_connections()) ->
-    guild_state().
-clear_expired_e2ee_keys(Expired, State, Remaining) ->
-    VoiceStates = voice_state_utils:voice_states(State),
-    lists:foldl(
-        fun({_ConnId, Metadata}, AccState) ->
-            clear_expired_e2ee_key(Metadata, VoiceStates, Remaining, AccState)
-        end,
-        State,
-        Expired
+%% A pending join that expired before completing must not leave a half-built DAVE
+%% room behind: drop the room for every affected channel that now has neither a
+%% live voice state nor another pending join.
+-spec retire_expired_dave_rooms([{binary(), map()}], guild_state()) -> guild_state().
+retire_expired_dave_rooms(Expired, State) ->
+    Channels = lists:usort([
+        ChannelId
+     || {_ConnId, Metadata} <- Expired,
+        ChannelId <- [pending_get_snowflake(Metadata, channel_id)],
+        is_integer(ChannelId),
+        ChannelId > 0
+    ]),
+    guild_voice_disconnect_broadcast:retire_voice_states(
+        Channels, #{}, voice_state_utils:voice_states(State), State
     ).
-
--spec clear_expired_e2ee_key(
-    map(), voice_state_map(), pending_voice_connections(), guild_state()
-) -> guild_state().
-clear_expired_e2ee_key(Metadata, VoiceStates, Remaining, AccState) ->
-    case pending_get_snowflake(Metadata, channel_id) of
-        ChannelId when is_integer(ChannelId), ChannelId > 0 ->
-            guild_voice_e2ee:forget_room_key_if_channel_idle_guild(
-                ChannelId, VoiceStates, Remaining, AccState
-            );
-        _ ->
-            AccState
-    end.
 
 -spec pending_get_value(map(), atom()) -> term().
 pending_get_value(PendingData, Key) ->

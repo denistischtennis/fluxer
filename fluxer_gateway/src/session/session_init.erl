@@ -13,7 +13,8 @@
     load_private_channels/1,
     load_relationships/1,
     build_state/1,
-    schedule_timers/1
+    schedule_timers/1,
+    dave_capable/1
 ]).
 
 -export_type([guild_id/0, session_state/0]).
@@ -246,8 +247,15 @@ extract_core_fields(
         bot => Bot,
         shard => maps:get(shard, D, undefined),
         is_staff => IsStaff,
-        e2ee_capable => maps:get(e2ee_capable, D, false)
+        e2ee_capable => dave_capable(maps:get(dave_max_version, D, 0)),
+        dave_max_version => maps:get(dave_max_version, D, 0)
     }.
+
+%% After the DAVE cutover `e2ee_capable' means "can speak DAVE >= 1". Derived once
+%% here instead of trusting the client-reported boolean across the voice modules.
+-spec dave_capable(term()) -> boolean().
+dave_capable(V) when is_integer(V), V >= 1 -> true;
+dave_capable(_) -> false.
 
 -spec extract_extra_fields(map(), map() | undefined) -> map().
 extract_extra_fields(D, Ready) ->

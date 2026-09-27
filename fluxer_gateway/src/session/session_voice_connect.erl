@@ -25,6 +25,7 @@ handle_voice_state_update(Data, State) ->
     SessionId = maps:get(id, State),
     UserId = maps:get(user_id, State),
     E2EECapable = maps:get(e2ee_capable, State, false),
+    DaveMaxVersion = maps:get(dave_max_version, State, 0),
     Bot = maps:get(bot, State, false),
     Guilds = maps:get(guilds, State),
     GuildIdRaw = maps:get(guild_id_raw, Params),
@@ -46,6 +47,7 @@ handle_voice_state_update(Data, State) ->
         session_id => SessionId,
         user_id => UserId,
         e2ee_capable => E2EECapable,
+        dave_max_version => DaveMaxVersion,
         bot => Bot,
         guilds => Guilds
     },
@@ -148,13 +150,14 @@ handle_dm_channel(ChId, Ctx, State) ->
         user_id := UserId,
         params := Params,
         e2ee_capable := E2EE,
+        dave_max_version := DaveMaxVersion,
         bot := Bot
     } = Ctx,
     ConnId = maps:get(connection_id, Params),
     case is_binary(ConnId) orelse ConnId =:= null of
         true ->
             handle_dm_connect(
-                ChId, Params, SId, UserId, E2EE, Bot, State
+                ChId, Params, SId, UserId, E2EE, DaveMaxVersion, Bot, State
             );
         false ->
             invalid_params_reply(UserId, SId, State)
@@ -256,10 +259,11 @@ log_dm_disconnect_err(UserId, SId, ConnId, Cat, Err) ->
     binary(),
     user_id(),
     boolean(),
+    non_neg_integer(),
     boolean(),
     session_state()
 ) -> voice_state_reply().
-handle_dm_connect(ChId, Params, SId, UserId, E2EE, Bot, State) ->
+handle_dm_connect(ChId, Params, SId, UserId, E2EE, DaveMaxVersion, Bot, State) ->
     ConnId = maps:get(connection_id, Params),
     Request = #{
         user_id => UserId,
@@ -275,12 +279,13 @@ handle_dm_connect(ChId, Params, SId, UserId, E2EE, Bot, State) ->
         latitude => maps:get(latitude, Params),
         longitude => maps:get(longitude, Params),
         e2ee_capable => E2EE,
+        dave_max_version => DaveMaxVersion,
         bot => Bot
     },
     StWithPid = State#{session_pid => self()},
     Result = dm_voice:voice_state_update(Request, StWithPid),
     handle_dm_connect_result(
-        Result, ChId, Params, SId, UserId, State
+        Result, ChId, Params, SId, UserId, DaveMaxVersion, State
     ).
 
 -spec handle_dm_connect_result(
@@ -289,6 +294,7 @@ handle_dm_connect(ChId, Params, SId, UserId, E2EE, Bot, State) ->
     map(),
     binary(),
     user_id(),
+    non_neg_integer(),
     session_state()
 ) -> voice_state_reply().
 handle_dm_connect_result(
@@ -297,10 +303,11 @@ handle_dm_connect_result(
     Params,
     SId,
     UserId,
+    DaveMaxVersion,
     State
 ) when is_map(NewState) ->
     log_dm_info("dm_needs_token", UserId, SId, ChId, Params),
-    spawn_voice_token_fetch(ChId, UserId, SId, Params),
+    spawn_voice_token_fetch(ChId, UserId, SId, Params, DaveMaxVersion),
     {reply, ok, merge_dm_voice_state(NewState, State)};
 handle_dm_connect_result(
     {reply, #{success := true}, NewState},
@@ -308,6 +315,7 @@ handle_dm_connect_result(
     Params,
     SId,
     UserId,
+    _DaveMaxVersion,
     State
 ) when is_map(NewState) ->
     log_dm_info("dm_ok", UserId, SId, ChId, Params),
@@ -318,6 +326,7 @@ handle_dm_connect_result(
     Params,
     SId,
     UserId,
+    _DaveMaxVersion,
     State
 ) ->
     ConnId = maps:get(connection_id, Params),
@@ -343,15 +352,15 @@ log_dm_info(Tag, UserId, SId, ChId, Params) ->
     logger:info(dm_ch_fmt(Tag), [UserId, SId, ChId, ConnId]).
 
 -spec spawn_voice_token_fetch(
-    channel_id(), user_id(), binary(), map()
+    channel_id(), user_id(), binary(), map(), non_neg_integer()
 ) -> pid().
-spawn_voice_token_fetch(ChId, UserId, SId, Params) ->
+spawn_voice_token_fetch(ChId, UserId, SId, Params, DaveMaxVersion) ->
     Lat = maps:get(latitude, Params),
     Lon = maps:get(longitude, Params),
     SessionPid = self(),
     spawn(fun() ->
         dm_voice:get_voice_token(
-            ChId, UserId, SId, SessionPid, Lat, Lon
+            ChId, UserId, SId, SessionPid, Lat, Lon, DaveMaxVersion
         )
     end).
 
@@ -403,11 +412,12 @@ guild_voice_queue(GuildPid, GId, ChId, Ctx, State) ->
         user_id := UserId,
         params := Params,
         e2ee_capable := E2EE,
+        dave_max_version := DaveMaxVersion,
         bot := Bot
     } = Ctx,
     ConnId = maps:get(connection_id, Params),
     log_guild_info("guild_queue", UserId, SId, GId, ChId, ConnId),
-    Req = build_guild_request(ChId, Params, UserId, SId, E2EE, Bot),
+    Req = build_guild_request(ChId, Params, UserId, SId, E2EE, Bot, DaveMaxVersion),
     VoiceCtx = #{
         guild_pid => GuildPid,
         guild_id => GId,
@@ -485,9 +495,10 @@ log_guild_warning(Tag, UserId, SId, GId, ChId, ConnId) ->
     user_id(),
     binary(),
     boolean(),
-    boolean()
+    boolean(),
+    non_neg_integer()
 ) -> map().
-build_guild_request(ChId, Params, UserId, SId, E2EE, Bot) ->
+build_guild_request(ChId, Params, UserId, SId, E2EE, Bot, DaveMaxVersion) ->
     #{
         user_id => UserId,
         session_id => SId,
@@ -502,5 +513,6 @@ build_guild_request(ChId, Params, UserId, SId, E2EE, Bot) ->
         latitude => maps:get(latitude, Params),
         longitude => maps:get(longitude, Params),
         e2ee_capable => E2EE,
+        dave_max_version => DaveMaxVersion,
         bot => Bot
     }.

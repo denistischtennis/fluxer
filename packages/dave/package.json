@@ -1,0 +1,23 @@
+{
+	"name": "@fluxer/dave",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"description": "DAVE protocol client library: session manager, ratchet wire, TOFU store, frame mapping",
+	"exports": {
+		".": "./src/index.ts",
+		"./frame-mapping": "./src/frameMapping.ts"
+	},
+	"scripts": {
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@fluxer/libdave": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/node": "catalog:",
+		"typescript": "catalog:ts7",
+		"vitest": "catalog:"
+	}
+}
