@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import {EventEmitter} from 'events';
+import {createKeyMaterialFromBuffer, createKeyMaterialFromString} from './utils.ts';
 import type TypedEventEmitter from 'typed-emitter';
 import log from '../logger.ts';
 import {KEY_PROVIDER_DEFAULTS} from './constants.ts';
@@ -55,3 +56,28 @@ export class BaseKeyProvider extends (EventEmitter as new () => TypedEventEmitte
 	}
 }
 
+
+/**
+ * Kept because `@livekit/components-react` statically imports this export from
+ * livekit-client; removing it breaks bundling of the voice UI components.
+ * Fluxer's own media E2EE is DAVE-only — nothing in fluxer constructs this
+ * provider; it exists solely to satisfy the third-party link.
+ */
+export class ExternalE2EEKeyProvider extends BaseKeyProvider {
+	ratchetInterval: number | undefined;
+
+	constructor(options: Partial<KeyProviderOptions> = {}) {
+		const opts: Partial<KeyProviderOptions> = {
+			...options,
+			ratchetWindowSize: 0,
+			failureTolerance: -1,
+		};
+		super(opts);
+	}
+
+	async setKey(key: string | ArrayBuffer) {
+		const derivedKey =
+			typeof key === 'string' ? await createKeyMaterialFromString(key) : await createKeyMaterialFromBuffer(key);
+		this.onSetEncryptionKey(derivedKey, 'external');
+	}
+}

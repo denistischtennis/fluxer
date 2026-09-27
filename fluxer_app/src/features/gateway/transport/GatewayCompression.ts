@@ -155,6 +155,17 @@ export class GatewayCompression {
 }
 
 export function getPreferredCompression(): CompressionType {
+	// Dev/debug override: run `localStorage.setItem('fluxer.gateway.compression', 'none')`
+	// in the browser console and reload to receive uncompressed gateway frames
+	// (human-readable JSON in the browser's Network > WS inspector).
+	try {
+		const forced = globalThis.localStorage?.getItem('fluxer.gateway.compression');
+		if (forced === 'none' || forced === 'zstd-stream') {
+			return forced;
+		}
+	} catch {
+		// storage unavailable -> default
+	}
 	return 'zstd-stream';
 }
 

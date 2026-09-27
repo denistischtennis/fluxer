@@ -1,0 +1,38 @@
+# LAN exposure override — bind the public entry points on all interfaces and
+# point every client-visible endpoint at the LAN address 192.168.1.212.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.lan.yml up -d
+services:
+  workspace:
+    environment:
+      FLUXER_PUBLIC_URL: "https://192.168.1.212"
+      FLUXER_API_ENDPOINT: "https://192.168.1.212/api"
+      FLUXER_API_CLIENT_ENDPOINT: "https://192.168.1.212/api"
+      FLUXER_APP_ENDPOINT: "https://192.168.1.212"
+      FLUXER_GATEWAY_ENDPOINT: "wss://192.168.1.212/gateway"
+      FLUXER_MEDIA_ENDPOINT: "https://192.168.1.212/media"
+      FLUXER_STATIC_CDN_ENDPOINT: "https://192.168.1.212"
+      FLUXER_ADMIN_ENDPOINT: "https://192.168.1.212/admin"
+      FLUXER_MEDIA_PROXY_PUBLIC_ENDPOINT: "https://192.168.1.212/media"
+      FLUXER_S3_PUBLIC_ENDPOINT: "https://192.168.1.212"
+      FLUXER_LIVEKIT_URL: "wss://192.168.1.212/livekit"
+      FLUXER_LIVEKIT_WEBHOOK_URL: "https://192.168.1.212/api/webhooks/livekit"
+      FLUXER_MEDIA_PROXY_UPLOAD_RELAY_ENDPOINT: "https://192.168.1.212/media"
+      FLUXER_GATEWAY_MEDIA_PROXY_ENDPOINT: "https://192.168.1.212/media"
+      FLUXER_GATEWAY_STATIC_CDN_ENDPOINT: "https://192.168.1.212"
+      FLUXER_ADMIN_OAUTH_REDIRECT_URI: "https://192.168.1.212/admin/oauth2_callback"
+      FLUXER_PASSKEY_ADDITIONAL_ALLOWED_ORIGINS: "https://192.168.1.212,http://localhost:8088"
+      # Dev-only: embind builds its JS invokers with new Function(); the strict
+      # production CSP must instead be satisfied by an EMBIND_AOT wasm build (TODO).
+      FLUXER_CSP_EXTRA_SCRIPT_SRC: "'unsafe-eval'"
+    ports: !override
+      - "8088:8088"
+  livekit:
+    volumes:
+      - ./livekit.lan.yaml:/etc/livekit.yaml:ro
+    ports: !override
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+  mailpit:
+    ports: !override
+      - "8025:8025"
