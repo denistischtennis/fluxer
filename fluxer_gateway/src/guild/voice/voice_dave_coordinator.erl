@@ -210,20 +210,22 @@ handle({proposals_created, ProposalsB64}, State) ->
         undefined ->
             {State, []};
         T = #{phase := preparing} ->
-            %% Every key-package holder must receive the proposals bundle for
-            %% this transition — including the joiner being added, whose own
-            %% add they will commit. Fan out here from the *live* state: the
-            %% old driver-level MemberProvider closure captured the pre-event
-            %% room snapshot, so founding transitions created during a user's
-            %% own KP validation delivered proposals to nobody and the room
-            %% hung in awaiting_commit forever.
+            %% Existing members receive the proposals bundle and race to
+            %% commit it. The added user(s) must NOT receive it: processing
+            %% an Add of their own key package collides with the join key
+            %% already present in their pending group ("Duplicate encryption
+            %% key"); their membership arrives via Welcome instead.
+            %% Fan-out is computed from the *live* state — the old
+            %% driver-level MemberProvider closure captured the pre-event
+            %% room snapshot and delivered founding proposals to nobody.
             Payload = #{
                 type => proposals,
                 transition_id => maps:get(id, T),
                 data => ProposalsB64
             },
-            Targets = maps:keys(maps:get(key_packages, State, #{})),
-            Sends = [{send_to_user, U, Payload} || U <- Targets],
+            AddedUsers = maps:get(target_users, T, []),
+            Recipients = maps:keys(maps:get(key_packages, State, #{})) -- AddedUsers,
+            Sends = [{send_to_user, U, Payload} || U <- Recipients],
             T1 = T#{proposals_b64 => ProposalsB64, phase => awaiting_commit},
             {State#{transition => T1}, Sends}
     end;
@@ -272,8 +274,11 @@ handle({commit_parsed, ok, Parsed}, State) ->
     %% commit through this echo (ProcessProposals merely builds a candidate),
     %% so any excluded member would stay on the old epoch and fail to decrypt
     %% post-transition media. Welcomes go only to the newly added members.
-    TargetUsers = target_users_for(T),
-    EchoUsers = lists:usort(all_present_users(State) ++ TargetUsers),
+    %% The winning commit is echoed to the members that existed *before*
+    %% this transition: they apply it through the echo. Newly added users
+    %% get a Welcome instead and must never process the commit themselves.
+    PrevMembers = [U || #{user_id := U} <- maps:get(roster, State, [])],
+    EchoUsers = lists:usort(PrevMembers),
     Announce = [
         {send_to_user, U, #{
             type => announce_commit_transition,
@@ -440,9 +445,26 @@ handle({validate_key_package_result, UserId, #{valid := true}}, State) ->
         {KpB64, Pending1} ->
             Kps = maps:get(key_packages, State, #{}),
             State1 = State#{pending_kps => Pending1, key_packages => Kps#{UserId => KpB64}},
-            %% One Add per bundle: every join is its own transition, gated
-            %% behind whatever transition is currently active.
-            maybe_start_add(State1, [UserId]);
+            Established = maps:get(established, State1, false),
+            case {Established, maps:get(transition, State1, undefined)} of
+                {false, undefined} ->
+                    %% Founding: the first validated member *is* the seed
+                    %% leaf of their own pending MLS group. Issuing an Add
+                    %% for them would collide with that leaf inside libdave
+                    %% ("Duplicate encryption key"), so founding is
+                    %% recorded directly; queued co-joiners proceed as
+                    %% real single-target adds afterwards.
+                    Founded = State1#{
+                        established => true,
+                        epoch => 0,
+                        roster => [#{user_id => UserId, leaf_index => 0}]
+                    },
+                    drain_next_add(Founded, []);
+                _ ->
+                    %% Already established (or a transition is still live):
+                    %% one Add per bundle, gated through the queue.
+                    maybe_start_add(State1, [UserId])
+            end;
         error ->
             %% Stale or duplicate result; ignore.
             {State, []}
@@ -658,20 +680,17 @@ passthrough_no_sender_package_test() ->
 founding_from_first_key_package_test() ->
     S0 = (new_room_state(false, <<"42">>))#{
         version => 1,
-        joined => #{<<"1001">> => true, <<"1002">> => true},
-        key_packages => #{<<"1001">> => <<"KPA">>},
-        pending_kps => #{<<"1002">> => <<"KPB">>}
+        joined => #{<<"1001">> => true},
+        pending_kps => #{<<"1001">> => <<"KPA">>}
     },
-    {S1, A1} = handle({validate_key_package_result, <<"1002">>, #{valid => true}}, S0),
-    %% One Add per bundle: the just-validated user gets a single-target
-    %% transition; co-present users are picked up by their own validation events.
-    T = maps:get(transition, S1),
-    ?assertEqual(preparing, maps:get(phase, T)),
-    ?assertEqual([<<"1002">>], maps:get(target_users, T)),
-    ?assert(has_rpc(A1, create_proposals)),
-    {Args, _Ref} = rpc_args(A1, create_proposals),
-    ?assertEqual([<<"KPB">>], maps:get(add_b64, Args)),
-    ?assertEqual([], maps:get(remove_indices, Args)).
+    {S1, A1} = handle({validate_key_package_result, <<"1001">>, #{valid => true}}, S0),
+    %% The founder is the seed leaf of their own pending group: establishing
+    %% happens locally, without any self-add transition or DS round-trip.
+    ?assertEqual(true, maps:get(established, S1)),
+    ?assertEqual(0, maps:get(epoch, S1)),
+    ?assertEqual([#{user_id => <<"1001">>, leaf_index => 0}], maps:get(roster, S1)),
+    ?assertEqual(undefined, maps:get(transition, S1, undefined)),
+    ?assertNot(has_rpc(A1, create_proposals)).
 
 concurrent_joins_serialize_through_queue_test() ->
     S0 = (new_room_state(false, <<"42">>))#{
@@ -711,7 +730,8 @@ proposals_relay_and_await_commit_test() ->
     T = maps:get(transition, S1),
     ?assertEqual(awaiting_commit, maps:get(phase, T)),
     ?assertEqual(<<"PROP">>, maps:get(proposals_b64, T)),
-    ?assert(lists:any(fun({send_to_user, _, #{type := proposals}}) -> true; (_) -> false end, A1)).
+    PropSends = [U || {send_to_user, U, #{type := proposals}} <- A1],
+    ?assertEqual([<<"1001">>], PropSends).
 
 commit_parsed_advances_epoch_test() ->
     S0 = awaiting_commit_state(),
@@ -728,8 +748,9 @@ commit_parsed_advances_epoch_test() ->
     ?assertEqual(1, maps:get(epoch, S1)),
     ?assertEqual(true, maps:get(established, S1)),
     ?assertEqual(undefined, maps:get(transition, S1)),
-    %% Announce goes to both members; welcome only to the newly added one.
-    ?assertEqual(2, count_type(A1, announce_commit_transition)),
+    %% Announce goes to the previous member applying the winning commit;
+    %% welcome only to the newly added one.
+    ?assertEqual(1, count_type(A1, announce_commit_transition)),
     ?assertEqual(1, count_type(A1, welcome)).
 
 ready_counting_executes_when_all_ready_test() ->
@@ -737,16 +758,16 @@ ready_counting_executes_when_all_ready_test() ->
     %% One of two ready -> no execute yet.
     {S1, A1} = handle({ready_for_transition, <<"1001">>, 1}, S0),
     ?assertEqual(0, count_type(A1, execute_transition)),
-    %% Both ready -> execute.
+    %% Target ready -> execute.
     {S2, A2} = handle({ready_for_transition, <<"1002">>, 1}, S1),
     ?assertEqual(undefined, maps:get(transition, S2)),
-    ?assertEqual(2, count_type(A2, execute_transition)).
+    ?assertEqual(1, count_type(A2, execute_transition)).
 
 timeout_forces_execute_test() ->
     S0 = ready_targets_state(),
     {S1, A1} = handle({transition_timeout, 1}, S0),
     ?assertEqual(undefined, maps:get(transition, S1)),
-    ?assertEqual(2, count_type(A1, execute_transition)).
+    ?assertEqual(1, count_type(A1, execute_transition)).
 
 invalid_commit_welcome_reinitializes_test() ->
     S0 = established_state(),
@@ -788,7 +809,9 @@ established_add_echoes_winning_commit_to_all_members_test() ->
     WelcomedTo = lists:usort([
         U || {send_to_user, U, P} <- A4, maps:get(type, P) =:= welcome
     ]),
-    ?assertEqual([<<"1001">>, <<"1002">>, <<"1003">>], AnnouncedTo),
+    %% Previous members get the echo; the joiner gets a Welcome instead
+    %% (processing its own add would collide with its pending join key).
+    ?assertEqual([<<"1001">>, <<"1002">>], AnnouncedTo),
     ?assertEqual([<<"1003">>], WelcomedTo),
     ?assertEqual(2, maps:get(epoch, S4)).
 
@@ -797,10 +820,13 @@ reset_then_key_package_refounds_at_mls_epoch_zero_test() ->
     {S1, _} = handle({invalid_commit_welcome, <<"1002">>}, S0),
     {S2, A2} = handle({key_package, <<"1001">>, <<"KP2">>}, S1),
     ?assert(has_rpc(A2, validate_key_package)),
-    {_S3, A3} = handle({validate_key_package_result, <<"1001">>, #{valid => true}}, S2),
-    ?assert(has_rpc(A3, create_proposals)),
-    {Args, _} = rpc_args(A3, create_proposals),
-    ?assertEqual(0, maps:get(epoch, Args)).
+    {S3, A3} = handle({validate_key_package_result, <<"1001">>, #{valid => true}}, S2),
+    %% Re-founding after an invalid commit: the first validated member
+    %% establishes the room locally at MLS epoch 0 without a self-add RPC.
+    ?assertEqual(true, maps:get(established, S3)),
+    ?assertEqual(0, maps:get(epoch, S3)),
+    ?assertEqual([#{user_id => <<"1001">>, leaf_index => 0}], maps:get(roster, S3)),
+    ?assertNot(has_rpc(A3, create_proposals)).
 
 sole_member_reset_test() ->
     S0 = established_two_users(),
@@ -895,15 +921,16 @@ member_left_retires_admission_and_key_package_test() ->
 %% --- test fixtures -------------------------------------------------------
 
 founding_state() ->
-    (new_room_state(false, <<"42">>))#{
+    (new_room_state(true, <<"42">>))#{
         version => 1,
         joined => #{<<"1001">> => true, <<"1002">> => true},
         key_packages => #{<<"1001">> => <<"KPA">>, <<"1002">> => <<"KPB">>},
+        roster => [#{user_id => <<"1001">>, leaf_index => 0}],
         transition => #{
             id => 1,
             phase => preparing,
             ready_set => #{},
-            target_users => [<<"1001">>, <<"1002">>],
+            target_users => [<<"1002">>],
             deadline_ms => 10000,
             initiated_by => undefined
         }

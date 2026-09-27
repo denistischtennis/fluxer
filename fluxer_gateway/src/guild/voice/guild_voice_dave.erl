@@ -329,13 +329,13 @@ founding_via_guild_driver_establishes_test() ->
         S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
         S1 = voice_dave_host:drive({join, <<"1001">>, 1}, S0, Driver),
         S2 = voice_dave_host:drive({key_package, <<"1001">>, <<"KPA">>}, S1, Driver),
-        S3 = voice_dave_host:drive({commit_welcome, <<"1001">>, <<"BUNDLE">>}, S2, Driver),
-        ?assertEqual(true, maps:get(established, S3)),
-        ?assertEqual(1, maps:get(epoch, S3)),
+        %% The synchronous validate cascade inside drive/3 founds the room on
+        %% the first validated member (seed leaf of their own pending group).
+        ?assertEqual(true, maps:get(established, S2)),
+        ?assertEqual(0, maps:get(epoch, S2)),
         Types = dispatched_types(),
         ?assert(has_type(<<"select_protocol_ack">>, Types)),
-        ?assert(has_type(<<"external_sender_package">>, Types)),
-        ?assert(has_type(<<"announce_commit_transition">>, Types))
+        ?assert(has_type(<<"external_sender_package">>, Types))
     after
         meck:unload(presence_manager)
     end.
@@ -401,8 +401,10 @@ drive_message_normalizes_and_drives_test() ->
             <<"1001">>,
             S0
         ),
-        %% key_package on an unestablished room creates an add transition
-        ?assert(maps:get(transition, S1, undefined) =/= undefined)
+        %% key_package from the first admitted member founds the room
+        %% locally (their pending group seed); no self-add transition.
+        ?assertEqual(true, maps:get(established, S1)),
+        ?assertEqual([#{user_id => <<"1001">>, leaf_index => 0}], maps:get(roster, S1))
     after
         meck:unload(rpc_client),
         meck:unload(presence_manager)

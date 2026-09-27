@@ -292,19 +292,27 @@ key_package_triggers_create_proposals_test() ->
     )),
     ?assertEqual(#{}, maps:get(key_packages, S2, #{})),
     S3 = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
+    %% Founder path: no self-add transition for the first member.
+    ?assertEqual(true, maps:get(established, S3)),
+    S4 = apply_event({join, <<"1002">>, 1}, S3, Ctx),
+    S5 = apply_event({key_package, <<"1002">>, <<"KP2">>}, S4, Ctx),
+    S6 = apply_event({validate_key_package_result, <<"1002">>, #{valid => true}}, S5, Ctx),
     Recorded = get_recorded(Rec),
     ?assert(lists:any(
         fun({rpc, create_proposals, Args, _}) ->
-            lists:member(<<"KP1">>, maps:get(add_b64, Args));
+            lists:member(<<"KP2">>, maps:get(add_b64, Args)) andalso
+                not lists:member(<<"KP1">>, maps:get(add_b64, Args));
            (_) ->
             false
         end,
         Recorded
     )),
-    ?assert(maps:get(transition, S3, undefined) =/= undefined),
+    ?assert(maps:get(transition, S6, undefined) =/= undefined),
     ok.
 
-%% proposals_created relays proposals to targets and flips phase to awaiting_commit.
+%% proposals_created relays to existing members only (never the added user,
+%% whose own-add bundle would collide with their pending join key) and flips
+%% the phase to awaiting_commit.
 proposals_created_broadcasts_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
@@ -312,10 +320,15 @@ proposals_created_broadcasts_test() ->
     S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
     S2 = apply_event({key_package, <<"1001">>, <<"KP1">>}, S1, Ctx),
     S2b = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
-    S3 = apply_event({proposals_created, <<"PROPS">>}, S2b, Ctx),
+    S3 = apply_event({join, <<"1002">>, 1}, S2b, Ctx),
+    S4 = apply_event({key_package, <<"1002">>, <<"KP2">>}, S3, Ctx),
+    S5 = apply_event({validate_key_package_result, <<"1002">>, #{valid => true}}, S4, Ctx),
+    S6 = apply_event({proposals_created, <<"PROPS">>}, S5, Ctx),
     Recorded = get_recorded(Rec),
-    ?assert(lists:any(fun({send, _, #{type := <<"proposals">>}}) -> true; (_) -> false end, Recorded)),
-    T = maps:get(transition, S3),
+    ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"proposals">>}}) -> true; (_) -> false end, Recorded)),
+    ?assertEqual(false, lists:any(
+        fun({send, <<"1002">>, #{type := <<"proposals">>}}) -> true; (_) -> false end, Recorded)),
+    T = maps:get(transition, S6),
     ?assertEqual(awaiting_commit, maps:get(phase, T)),
     ok.
 
@@ -452,16 +465,26 @@ driving_founding_reaches_established_test() ->
     ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"select_protocol_ack">>}}) -> true; (_) -> false end, R1)),
     ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"external_sender_package">>}}) -> true; (_) -> false end, R1)),
     ?assertEqual(false, maps:get(established, S1)),
-    %% Key package -> add transition -> proposals relayed.
+    %% First validated key package establishes the room locally: the founder
+    %% is the seed leaf of their own pending group, so no self-add fires.
     S2 = drive({key_package, <<"1001">>, <<"KPA">>}, S1, Driver),
-    R2 = get_recorded(Rec),
-    ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"proposals">>}}) -> true; (_) -> false end, R2)),
-    %% Committer commits -> parse_commit RPC -> announce + established.
-    S3 = drive({commit_welcome, <<"1001">>, <<"BUNDLE">>}, S2, Driver),
-    R3 = get_recorded(Rec),
-    ?assertEqual(true, maps:get(established, S3)),
-    ?assertEqual(1, maps:get(epoch, S3)),
-    ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"announce_commit_transition">>}}) -> true; (_) -> false end, R3)),
+    S2v = drive({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Driver),
+    ?assertEqual(true, maps:get(established, S2v)),
+    %% Second member joins -> single-add transition -> proposals relayed to
+    %% the founder only.
+    S3 = drive({join, <<"1002">>, 1}, S2v, Driver),
+    S4 = drive({key_package, <<"1002">>, <<"KPB">>}, S3, Driver),
+    S5 = drive({validate_key_package_result, <<"1002">>, #{valid => true}}, S4, Driver),
+    R5 = get_recorded(Rec),
+    ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"proposals">>}}) -> true; (_) -> false end, R5)),
+    ?assertEqual(false, lists:any(
+        fun({send, <<"1002">>, #{type := <<"proposals">>}}) -> true; (_) -> false end, R5)),
+    %% Committer commits -> parse_commit RPC -> announce to founder, welcome
+    %% to the joiner, epoch advanced.
+    S6 = drive({commit_welcome, <<"1001">>, <<"BUNDLE">>}, S5, Driver),
+    R6 = get_recorded(Rec),
+    ?assertEqual(true, maps:get(established, S6)),
+    ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"announce_commit_transition">>}}) -> true; (_) -> false end, R6)),
     ok.
 
 %% API failure halts the cascade without corrupting state.
