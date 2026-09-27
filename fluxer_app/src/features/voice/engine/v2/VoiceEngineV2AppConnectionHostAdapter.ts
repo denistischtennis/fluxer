@@ -1169,6 +1169,9 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		const {room} = this.connectionState;
 		this.clearVoiceServerTimeout();
 		this.abortHotSwap();
+		// New channel means a new MLS group; the old session must not linger
+		// (same rejoin-corruption class as disconnectFromVoiceChannel).
+		this.teardownDave();
 		if (room) {
 			room.removeAllListeners();
 			room.disconnect();
