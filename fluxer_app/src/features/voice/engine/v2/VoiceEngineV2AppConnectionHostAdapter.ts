@@ -214,6 +214,14 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	private isLocalDisconnecting = false;
 	private hotSwapOperationQueue: Array<HotSwapQueuedOperation> = [];
 	private daveClient: DaveClient | null = null;
+	/**
+	 * DAVE downlink events that arrived before the DaveClient existed. The join
+	 * cascade (select_protocol_ack + external_sender_package) fires while the
+	 * LiveKit room is still connecting; without this buffer they are lost and the
+	 * MLS handshake never starts. Replayed in bindDaveSession, cleared in
+	 * teardownDave. Capped FIFO.
+	 */
+	private earlyDaveEvents: DaveDownMessage[] = [];
 	// Sink installed by the join path to push ratchets and passthrough windows
 	// into the E2EE worker of the currently active room.
 	private daveKeySink: DaveKeyMaterialSink | null = null;
@@ -258,6 +266,17 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	routeDaveProtocolEvent(down: DaveDownMessage): void {
 		const client = this.daveClient;
 		if (client === null) {
+			const targetChannelId = this.connectionState.channelId;
+			if (targetChannelId !== null && down.channel_id === targetChannelId) {
+				if (this.earlyDaveEvents.length >= 64) {
+					this.earlyDaveEvents.shift();
+					logger.warn('DAVE early-event buffer overflow; dropped oldest event', {type: down.type});
+				}
+				this.earlyDaveEvents.push(down);
+				logger.debug('Buffered DAVE event before client ready', {type: down.type});
+			} else {
+				logger.debug('Dropping DAVE event for non-target channel', {type: down.type});
+			}
 			return;
 		}
 		client.onEvent(down);
@@ -325,6 +344,13 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		room.on(RoomEvent.ParticipantDisconnected, (peer) => this.handleDavePeerLeft(peer.identity));
 		this.bindDaveTrackCodecs(room);
 		this.syncDaveKeyMaterial();
+		// Replay downlink events that raced ahead of the connection.
+		const pending = this.earlyDaveEvents;
+		this.earlyDaveEvents = [];
+		for (const down of pending) {
+			logger.debug('Replaying buffered DAVE event', {type: down.type});
+			this.routeDaveProtocolEvent(down);
+		}
 	}
 
 	/**
@@ -1397,6 +1423,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		this.daveClient = null;
 		this.daveKeySink = null;
 		this.tofuUnavailableLogged = false;
+		this.earlyDaveEvents = [];
 	}
 
 	private disconnectPreviousRoom(previousRoom: Room | null, stopTracks = true): void {

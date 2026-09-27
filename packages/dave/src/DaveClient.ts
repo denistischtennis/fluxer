@@ -46,6 +46,7 @@ export interface DaveDownMessage {
 	epoch?: string | number;
 	data?: string;
 	target_user_id?: string;
+	channel_id?: string;
 }
 
 export interface CreateDaveClientParams {

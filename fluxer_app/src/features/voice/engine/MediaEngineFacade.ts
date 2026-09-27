@@ -1511,9 +1511,9 @@ class MediaEngineFacade extends Store {
 	 * resulting ratchets into the room E2EE worker.
 	 */
 	handleDaveProtocolEvent(data: import('../events/DaveProtocolEvent.js').DaveProtocolEventPayload): void {
-		if (!voiceEngineV2AppConnectionHostAdapter.connected) {
-			return;
-		}
+		// No connected-gate here: the join cascade arrives before the LiveKit
+		// connection completes; the adapter buffers those events and replays
+		// them once its DaveClient is bound.
 		voiceEngineV2AppConnectionHostAdapter.routeDaveProtocolEvent(data);
 	}
 
