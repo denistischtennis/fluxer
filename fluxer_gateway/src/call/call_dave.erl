@@ -155,7 +155,7 @@ negotiate_join_stores_room_impl() ->
         meck:expect(
             rpc_client,
             call,
-            fun(_) -> {ok, #{<<"data">> => #{<<"sender_package_b64">> => <<"S">>}}} end
+            fun(_) -> {ok, #{<<"sender_package_b64">> => <<"S">>}} end
         ),
         {ok, Version, NewState} = negotiate_join(<<"1001">>, 1, #{channel_id => 555}),
         ?assertEqual(1, Version),

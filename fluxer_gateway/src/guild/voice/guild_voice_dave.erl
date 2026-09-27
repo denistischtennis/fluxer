@@ -181,8 +181,11 @@ api_call(Method, Args) ->
     Base = to_binary_keys(Args),
     Request = Base#{<<"type">> => Type},
     case rpc_client:call(Request) of
-        {ok, Response} when is_map(Response) ->
-            {ok, maps:get(<<"data">>, Response, #{})};
+        {ok, Data} when is_map(Data) ->
+            %% NOTE: rpc_client:call/1 already unwraps the HTTP envelope's
+            %% `data' field (handle_http_response returns {ok, Data}). Do NOT
+            %% unwrap again here — doing so silently emptied every DAVE result.
+            {ok, Data};
         {error, _} = Err ->
             Err;
         Other ->
@@ -252,7 +255,7 @@ api_call_ok_test() ->
             call,
             fun(Req) ->
                 ?assertEqual(<<"dave_sender_package">>, maps:get(<<"type">>, Req)),
-                {ok, #{<<"data">> => #{<<"sender_package_b64">> => <<"PKG">>}}}
+                {ok, #{<<"sender_package_b64">> => <<"PKG">>}}
             end
         ),
         {ok, Data} = api_call(sender_package, #{}),
@@ -404,7 +407,7 @@ drive_join_returns_negotiated_version_test() ->
         meck:expect(
             rpc_client,
             call,
-            fun(_) -> {ok, #{<<"data">> => #{<<"sender_package_b64">> => <<"S">>}}} end
+            fun(_) -> {ok, #{<<"sender_package_b64">> => <<"S">>}} end
         ),
         S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
         {Version, S1} = drive_join(<<"1001">>, 1, <<"42">>, S0, fun() -> [] end),
@@ -424,7 +427,7 @@ drive_message_normalizes_and_drives_test() ->
             rpc_client,
             call,
             fun(_) ->
-                {ok, #{<<"data">> => #{<<"proposals_b64">> => <<"P">>, <<"valid">> => true}}}
+                {ok, #{<<"proposals_b64">> => <<"P">>, <<"valid">> => true}}
             end
         ),
         S0 = (voice_dave_coordinator:new_room_state(false, <<"42">>))#{
