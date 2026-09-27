@@ -17,6 +17,9 @@
 %%   roster        :: [#{user_id, leaf_index}]  last-known post-commit roster
 %%   transition    :: undefined | transition()
 %%   pending_removals :: [LeafIndex]     batched removal targets awaiting flush
+%%   add_queue     :: [UserId]           validated joins waiting their turn; a
+%%                                     libdave proposals bundle carries exactly
+%%                                     one Add, so joins are serialized
 %%
 %% A transition() is:
 %%   #{id, phase, ready_set, deadline_ms, proposals_b64, initiated_by}
@@ -89,6 +92,7 @@ new_room_state(Established, GroupIdBin) ->
         roster => [],
         transition => undefined,
         pending_removals => [],
+        add_queue => [],
         next_transition_id => 1
     }.
 
@@ -120,7 +124,8 @@ handle({join, UserId, MaxVersion}, State) when is_binary(UserId), is_integer(Max
                 transition => undefined,
                 key_packages => #{},
                 roster => [],
-                pending_removals => []
+                pending_removals => [],
+                add_queue => []
             },
             Reinit = [
                 {send_to_user, U, #{
@@ -297,7 +302,7 @@ handle({commit_parsed, ok, Parsed}, State) ->
         roster => Roster,
         transition => undefined
     },
-    {State1, Announce ++ Welcomes};
+    drain_next_add(State1, Announce ++ Welcomes);
 
 handle({commit_parsed, error, _Reason}, State) ->
     %% Losing/invalid commit; leave current transition intact so another may win.
@@ -319,7 +324,8 @@ handle({ready_for_transition, UserId, TransitionId}, State) ->
                     T1 = T#{ready_set => Ready1},
                     case AllReady of
                         true ->
-                            execute_transition(State#{transition => T1});
+                            {SE, AE} = execute_transition(State#{transition => T1}),
+                            drain_next_add(SE, AE);
                         false ->
                             {State#{transition => T1}, []}
                     end;
@@ -333,7 +339,8 @@ handle({ready_for_transition, UserId, TransitionId}, State) ->
 handle({transition_timeout, TransitionId}, State) ->
     case maps:get(transition, State, undefined) of
         _T = #{id := TransitionId} ->
-            execute_transition(State);
+            {SE, AE} = execute_transition(State),
+            drain_next_add(SE, AE);
         _ ->
             {State, []}
     end;
@@ -360,7 +367,8 @@ handle({invalid_commit_welcome, UserId}, State) ->
                 key_packages => #{},
                 pending_kps => #{},
                 roster => [],
-                pending_removals => []
+                pending_removals => [],
+                add_queue => []
             },
             Actions = [
                 {send_to_user, U, #{type => prepare_epoch, epoch => 1, version => maps:get(version, State, 0)}}
@@ -380,7 +388,8 @@ handle({member_left, UserId}, State) ->
     StateR = State#{
         joined => maps:remove(UserId, maps:get(joined, State, #{})),
         key_packages => maps:remove(UserId, maps:get(key_packages, State, #{})),
-        pending_kps => maps:remove(UserId, maps:get(pending_kps, State, #{}))
+        pending_kps => maps:remove(UserId, maps:get(pending_kps, State, #{})),
+        add_queue => lists:delete(UserId, maps:get(add_queue, State, []))
     },
     Members = all_present_users(StateR),
     Remaining = Members -- [UserId],
@@ -429,16 +438,9 @@ handle({validate_key_package_result, UserId, #{valid := true}}, State) ->
         {KpB64, Pending1} ->
             Kps = maps:get(key_packages, State, #{}),
             State1 = State#{pending_kps => Pending1, key_packages => Kps#{UserId => KpB64}},
-            Established = maps:get(established, State1, false),
-            case Established of
-                false ->
-                    %% Founding trigger: first validated key package starts the
-                    %% group with everyone validated so far.
-                    start_add_transition(State1, all_present_users(State1));
-                true ->
-                    %% Already established: add this single user.
-                    start_add_transition(State1, [UserId])
-            end;
+            %% One Add per bundle: every join is its own transition, gated
+            %% behind whatever transition is currently active.
+            maybe_start_add(State1, [UserId]);
         error ->
             %% Stale or duplicate result; ignore.
             {State, []}
@@ -452,6 +454,33 @@ handle({validate_key_package_result, UserId, #{valid := false, reason := Reason}
 %% --------------------------------------------------------------------------
 %% Internal helpers
 %% --------------------------------------------------------------------------
+
+%% Gate: only one MLS transition may be live at a time. Extra targets wait in
+%% `add_queue' (arrival order, deduplicated) and are released one per completed
+%% transition by drain_next_add/2.
+-spec maybe_start_add(room_state(), [user_id()]) -> {room_state(), [action()]}.
+maybe_start_add(State, Targets) ->
+    case maps:get(transition, State, undefined) of
+        undefined ->
+            start_add_transition(State, Targets);
+        _Active ->
+            Queue0 = maps:get(add_queue, State, []),
+            Queue1 = Queue0 ++ [U || U <- Targets, not lists:member(U, Queue0)],
+            {State#{add_queue => Queue1}, []}
+    end.
+
+%% Release exactly one queued add (the caller just freed the transition slot).
+%% Releasing more than one eagerly would sign overlapping proposals for the same
+%% epoch before the previous transition's welcome has been delivered.
+-spec drain_next_add(room_state(), [action()]) -> {room_state(), [action()]}.
+drain_next_add(State, Actions) ->
+    case maps:get(add_queue, State, []) of
+        [] ->
+            {State, Actions};
+        [Next | Rest] ->
+            {S1, A1} = start_add_transition(State#{add_queue => Rest}, [Next]),
+            {S1, Actions ++ A1}
+    end.
 
 -spec start_add_transition(room_state(), [user_id()]) -> {room_state(), [action()]}.
 start_add_transition(State, TargetUsers) ->
@@ -633,13 +662,47 @@ founding_from_first_key_package_test() ->
         pending_kps => #{<<"1002">> => <<"KPB">>}
     },
     {S1, A1} = handle({validate_key_package_result, <<"1002">>, #{valid => true}}, S0),
-    %% Founding: not yet established -> add transition targeting present users.
+    %% One Add per bundle: the just-validated user gets a single-target
+    %% transition; co-present users are picked up by their own validation events.
     T = maps:get(transition, S1),
     ?assertEqual(preparing, maps:get(phase, T)),
+    ?assertEqual([<<"1002">>], maps:get(target_users, T)),
     ?assert(has_rpc(A1, create_proposals)),
     {Args, _Ref} = rpc_args(A1, create_proposals),
-    ?assertEqual([<<"KPA">>, <<"KPB">>], lists:sort(maps:get(add_b64, Args))),
+    ?assertEqual([<<"KPB">>], maps:get(add_b64, Args)),
     ?assertEqual([], maps:get(remove_indices, Args)).
+
+concurrent_joins_serialize_through_queue_test() ->
+    S0 = (new_room_state(false, <<"42">>))#{
+        version => 1,
+        joined => #{<<"1001">> => true, <<"1002">> => true},
+        key_packages => #{<<"1001">> => <<"KPA">>},
+        pending_kps => #{<<"1002">> => <<"KPB">>},
+        transition => #{
+            id => 1,
+            phase => awaiting_commit,
+            ready_set => #{},
+            target_users => [<<"1001">>],
+            deadline_ms => 10000,
+            initiated_by => undefined
+        }
+    },
+    %% Second joiner validates while a transition is live -> queued, no new RPC.
+    {S1, A1} = handle({validate_key_package_result, <<"1002">>, #{valid => true}}, S0),
+    ?assertEqual([<<"1002">>], maps:get(add_queue, S1)),
+    ?assertNot(has_rpc(A1, create_proposals)),
+    %% Winning commit for the first transition completes -> queue drains into a
+    %% fresh single-add transition for 1002.
+    Parsed = #{new_epoch => 1, roster => [#{user_id => <<"1001">>, leaf_index => 0}],
+               welcome_b64 => <<"W">>, commit_b64 => <<"C">>},
+    {S2, A2} = handle({commit_parsed, ok, Parsed}, S1),
+    ?assertEqual([], maps:get(add_queue, S2)),
+    T2 = maps:get(transition, S2),
+    ?assertEqual([<<"1002">>], maps:get(target_users, T2)),
+    ?assert(has_rpc(A2, create_proposals)),
+    {Args2, _R2} = rpc_args(A2, create_proposals),
+    ?assertEqual([<<"KPB">>], maps:get(add_b64, Args2)),
+    ?assertEqual(1, maps:get(epoch, S2)).
 
 proposals_relay_and_await_commit_test() ->
     S0 = founding_state(),
