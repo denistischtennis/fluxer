@@ -211,8 +211,7 @@ dave_member_left(VoiceState, State) ->
                 undefined ->
                     State;
                 RS ->
-                    Members = fun() -> maps:keys(maps:get(key_packages, RS, #{})) end,
-                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, RS, Members) of
+                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, RS) of
                         NewRS -> State#{dave_rooms => Rooms#{ChIdBin => NewRS}}
                     catch
                         _:_ ->

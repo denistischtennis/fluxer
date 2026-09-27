@@ -209,18 +209,15 @@ handle_call_local({set_voice_states, VoiceStates}, State) when is_map(VoiceState
     {reply, ok, do_set_voice_states(VoiceStates, State)};
 handle_call_local({dave_join, ChIdBin, UserId, MaxVer}, State) ->
     RoomState = dave_room(ChIdBin, State),
-    Members = dave_members_from(RoomState),
-    {Version, NewRoom} = guild_voice_dave:drive_join(UserId, MaxVer, ChIdBin, RoomState, Members),
+    {Version, NewRoom} = guild_voice_dave:drive_join(UserId, MaxVer, ChIdBin, RoomState),
     {reply, {ok, Version}, put_dave_room(ChIdBin, NewRoom, State)};
 handle_call_local({dave_message, ChIdBin, Sender, Raw}, State) ->
     RoomState = dave_room(ChIdBin, State),
-    Members = dave_members_from(RoomState),
-    NewRoom = guild_voice_dave:drive_message(ChIdBin, Raw, Sender, RoomState, Members),
+    NewRoom = guild_voice_dave:drive_message(ChIdBin, Raw, Sender, RoomState),
     {reply, ok, put_dave_room(ChIdBin, NewRoom, State)};
 handle_call_local({dave_member_left, ChIdBin, UserBin}, State) ->
     RoomState = dave_room(ChIdBin, State),
-    Members = dave_members_from(RoomState),
-    NewRoom = guild_voice_dave:drive_member_left(ChIdBin, UserBin, RoomState, Members),
+    NewRoom = guild_voice_dave:drive_member_left(ChIdBin, UserBin, RoomState),
     {reply, ok, put_dave_room(ChIdBin, NewRoom, State)};
 handle_call_local(_, State) ->
     {reply, ok, State}.
@@ -242,10 +239,6 @@ put_dave_room(ChIdBin, RoomState, State) ->
 
 %% Members for broadcast fan-out: users with a key package in the room (binary
 %% snowflake ids). Derived from the room itself so no cross-representation juggling.
--spec dave_members_from(voice_dave_coordinator:room_state()) -> fun(() -> [binary()]).
-dave_members_from(RoomState) ->
-    fun() -> maps:keys(maps:get(key_packages, RoomState, #{})) end.
-
 -spec channel_query(voice_states | pending_joins, term(), server_state()) -> map().
 channel_query(Kind, ChIdBin, State) ->
     case guild_voice_server_state:parse_voice_channel_id(ChIdBin) of
@@ -308,8 +301,7 @@ handle_info({'EXIT', Pid, Reason}, #{guild_pid := GuildPid} = State) when Pid =:
     {stop, normal, State};
 handle_info({dave_timer, ChIdBin, Msg}, State) ->
     RoomState = dave_room(ChIdBin, State),
-    Members = dave_members_from(RoomState),
-    NewRoom = guild_voice_dave:drive_timer(ChIdBin, Msg, RoomState, Members),
+    NewRoom = guild_voice_dave:drive_timer(ChIdBin, Msg, RoomState),
     {noreply, put_dave_room(ChIdBin, NewRoom, State)};
 handle_info(_, State) ->
     {noreply, State}.

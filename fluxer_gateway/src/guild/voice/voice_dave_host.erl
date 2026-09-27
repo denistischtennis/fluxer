@@ -33,7 +33,6 @@
 -type user_id() :: binary().
 -type ctx() :: #{
     send := fun((user_id(), map()) -> ok),
-    broadcast := fun((map()) -> ok),
     rpc := fun((atom(), map(), term()) -> ok),
     timer := fun((term(), pos_integer()) -> ok),
     warn := fun((term()) -> ok)
@@ -61,7 +60,6 @@ apply_event(Event, RoomState, Ctx) ->
 %% --------------------------------------------------------------------------
 -type driver() :: #{
     send := fun((user_id(), map()) -> ok),
-    broadcast := fun((map()) -> ok),
     rpc := fun((atom(), map(), term()) -> ok),
     timer := fun((term(), pos_integer()) -> ok),
     warn := fun((term()) -> ok),
@@ -100,10 +98,6 @@ run_actions([], _Ctx) ->
 run_actions([{send_to_user, UserId, Payload} | Rest], Ctx) ->
     Send = maps:get(send, Ctx),
     Send(UserId, ensure_binary_type(Payload)),
-    run_actions(Rest, Ctx);
-run_actions([{broadcast_channel, Payload} | Rest], Ctx) ->
-    Broadcast = maps:get(broadcast, Ctx),
-    Broadcast(ensure_binary_type(Payload)),
     run_actions(Rest, Ctx);
 run_actions([{dave_rpc, Method, Args, Ref} | Rest], Ctx) ->
     Rpc = maps:get(rpc, Ctx),
@@ -226,7 +220,6 @@ get_recorded(Pid) ->
 recording_ctx(Pid) ->
     #{
         send => fun(U, P) -> record(Pid, {send, U, P}) end,
-        broadcast => fun(P) -> record(Pid, {broadcast, P}) end,
         rpc => fun(M, A, R) -> record(Pid, {rpc, M, A, R}) end,
         timer => fun(M, T) -> record(Pid, {timer, M, T}) end,
         warn => fun(W) -> record(Pid, {warn, W}) end
@@ -321,7 +314,7 @@ proposals_created_broadcasts_test() ->
     S2b = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
     S3 = apply_event({proposals_created, <<"PROPS">>}, S2b, Ctx),
     Recorded = get_recorded(Rec),
-    ?assert(lists:any(fun({broadcast, #{type := <<"proposals">>}}) -> true; (_) -> false end, Recorded)),
+    ?assert(lists:any(fun({send, _, #{type := <<"proposals">>}}) -> true; (_) -> false end, Recorded)),
     T = maps:get(transition, S3),
     ?assertEqual(awaiting_commit, maps:get(phase, T)),
     ok.
@@ -424,14 +417,13 @@ run_actions_all_types_test() ->
     Ctx = recording_ctx(Rec),
     Actions = [
         {send_to_user, <<"u1">>, #{type => x}},
-        {broadcast_channel, #{type => y}},
         {dave_rpc, m, #{a => 1}, ref},
         {schedule_timer, msg, 100},
         {log_warning, w}
     ],
     ok = run_actions(Actions, Ctx),
     R = get_recorded(Rec),
-    ?assertEqual(5, length(R)),
+    ?assertEqual(4, length(R)),
     ok.
 
 %% --- synchronous full-handshake cascade ----------------------------------
@@ -463,7 +455,7 @@ driving_founding_reaches_established_test() ->
     %% Key package -> add transition -> proposals relayed.
     S2 = drive({key_package, <<"1001">>, <<"KPA">>}, S1, Driver),
     R2 = get_recorded(Rec),
-    ?assert(lists:any(fun({broadcast, #{type := <<"proposals">>}}) -> true; (_) -> false end, R2)),
+    ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"proposals">>}}) -> true; (_) -> false end, R2)),
     %% Committer commits -> parse_commit RPC -> announce + established.
     S3 = drive({commit_welcome, <<"1001">>, <<"BUNDLE">>}, S2, Driver),
     R3 = get_recorded(Rec),

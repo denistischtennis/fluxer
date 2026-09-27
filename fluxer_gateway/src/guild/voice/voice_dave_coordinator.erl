@@ -47,7 +47,6 @@
 -type roster_entry() :: #{user_id => user_id(), leaf_index => non_neg_integer()}.
 -type action() ::
     {send_to_user, user_id(), map()}
-    | {broadcast_channel, map()}
     | {dave_rpc, atom(), map(), reference()}
     | {schedule_timer, term(), pos_integer()}
     | {log_warning, term()}.
@@ -211,19 +210,22 @@ handle({proposals_created, ProposalsB64}, State) ->
         undefined ->
             {State, []};
         T = #{phase := preparing} ->
-            %% Relay the signed external proposals with a single channel-wide
-            %% broadcast. The owner fans it out to every connected member, and
-            %% by construction every transition target is already a member
-            %% (their key package was promoted before create_proposals ran), so
-            %% per-target sends would only duplicate delivery — making each
-            %% target build two commit candidates and doubling DS parse work.
-            Broadcast = {broadcast_channel, #{
+            %% Every key-package holder must receive the proposals bundle for
+            %% this transition — including the joiner being added, whose own
+            %% add they will commit. Fan out here from the *live* state: the
+            %% old driver-level MemberProvider closure captured the pre-event
+            %% room snapshot, so founding transitions created during a user's
+            %% own KP validation delivered proposals to nobody and the room
+            %% hung in awaiting_commit forever.
+            Payload = #{
                 type => proposals,
                 transition_id => maps:get(id, T),
                 data => ProposalsB64
-            }},
+            },
+            Targets = maps:keys(maps:get(key_packages, State, #{})),
+            Sends = [{send_to_user, U, Payload} || U <- Targets],
             T1 = T#{proposals_b64 => ProposalsB64, phase => awaiting_commit},
-            {State#{transition => T1}, [Broadcast]}
+            {State#{transition => T1}, Sends}
     end;
 
 %% --------------------------------------------------------------------------
@@ -628,7 +630,6 @@ count_type(Actions, Type) ->
      || X <- Actions,
         case X of
             {send_to_user, _, #{type := T}} -> T =:= Type;
-            {broadcast_channel, #{type := T}} -> T =:= Type;
             _ -> false
         end
     ]).
@@ -710,7 +711,7 @@ proposals_relay_and_await_commit_test() ->
     T = maps:get(transition, S1),
     ?assertEqual(awaiting_commit, maps:get(phase, T)),
     ?assertEqual(<<"PROP">>, maps:get(proposals_b64, T)),
-    ?assert(lists:any(fun({broadcast_channel, _}) -> true; (_) -> false end, A1)).
+    ?assert(lists:any(fun({send_to_user, _, #{type := proposals}}) -> true; (_) -> false end, A1)).
 
 commit_parsed_advances_epoch_test() ->
     S0 = awaiting_commit_state(),

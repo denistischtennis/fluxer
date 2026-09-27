@@ -53,8 +53,7 @@ handle_message(Raw, SenderBin, State) ->
     case channel_key_safe(State) of
         {ok, ChIdBin} ->
             Room = room_in(ChIdBin, State),
-            Members = members_fun(Room),
-            try guild_voice_dave:drive_message(ChIdBin, Raw, SenderBin, Room, Members) of
+            try guild_voice_dave:drive_message(ChIdBin, Raw, SenderBin, Room) of
                 NewRoom -> put_room(ChIdBin, NewRoom, State)
             catch
                 Class:Reason ->
@@ -79,8 +78,7 @@ member_left(UserBin, State) ->
                 undefined ->
                     State;
                 Room ->
-                    Members = members_fun(Room),
-                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, Room, Members) of
+                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, Room) of
                         NewRoom -> put_room(ChIdBin, NewRoom, State)
                     catch
                         Class:Reason ->
@@ -118,13 +116,6 @@ room_in(ChIdBin, State) ->
 put_room(ChIdBin, Room, State) ->
     Rooms = maps:get(dave_rooms, State, #{}),
     State#{dave_rooms => Rooms#{ChIdBin => Room}}.
-
-%% Broadcast fan-out set: users that already contributed a key package.
--spec members_fun(voice_dave_coordinator:room_state() | undefined) -> fun(() -> [user_id()]).
-members_fun(undefined) ->
-    fun() -> [] end;
-members_fun(Room) ->
-    fun() -> maps:keys(maps:get(key_packages, Room, #{})) end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

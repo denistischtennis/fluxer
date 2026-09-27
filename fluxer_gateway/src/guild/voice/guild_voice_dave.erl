@@ -12,12 +12,12 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    build_driver/2,
-    drive_join/5,
+    build_driver/1,
+    drive_join/4,
     negotiate_join/4,
-    drive_message/5,
-    drive_member_left/4,
-    drive_timer/4,
+    drive_message/4,
+    drive_member_left/3,
+    drive_timer/3,
     api_call/2,
     method_to_type/1
 ]).
@@ -28,19 +28,13 @@
 %% --------------------------------------------------------------------------
 %% Build the driver map for a channel.
 %%
-%%   MemberProvider :: fun(() -> [user_id()])  current channel members (excludes
-%%                    the per-message sender nuance; broadcast fans to all).
 %% --------------------------------------------------------------------------
--spec build_driver(channel_id(), fun(() -> [user_id()])) -> voice_dave_host:driver().
-build_driver(ChannelId, MemberProvider) ->
+-spec build_driver(channel_id()) -> voice_dave_host:driver().
+build_driver(ChannelId) ->
     #{
         send =>
             fun(UserId, Payload) ->
                 dispatch(UserId, Payload, ChannelId)
-            end,
-        broadcast =>
-            fun(Payload) ->
-                [dispatch(U, Payload, ChannelId) || U <- MemberProvider()]
             end,
         rpc =>
             fun(_Method, _Args, _Ref) ->
@@ -66,18 +60,16 @@ build_driver(ChannelId, MemberProvider) ->
 %% --------------------------------------------------------------------------
 %% High-level entry points called by the owning guild_voice_server. Each threads
 %% the per-channel MLS room state through the synchronous host driver and returns
-%% the updated state. `MemberProvider' supplies current channel member ids for
-%% broadcast fan-out.
+%% the updated state. Fan-out targets are computed inside the coordinator from
+%% the live room state (never from a pre-event closure).
 %% --------------------------------------------------------------------------
--spec drive_join(user_id(), non_neg_integer(), channel_id(), voice_dave_coordinator:room_state(), fun(
-    () -> [user_id()]
-)) ->
+-spec drive_join(user_id(), non_neg_integer(), channel_id(), voice_dave_coordinator:room_state()) ->
     {non_neg_integer(), voice_dave_coordinator:room_state()}.
-drive_join(UserId, MaxVersion, ChannelId, RoomState, MemberProvider) ->
+drive_join(UserId, MaxVersion, ChannelId, RoomState) ->
     %% The channel id must ride along on every downlink event; the client drops
     %% DAVE_PROTOCOL_EVENTs without a usable channel_id, so passing <<>> here
     %% would silently kill the join handshake.
-    Driver = build_driver(ChannelId, MemberProvider),
+    Driver = build_driver(ChannelId),
     NewState = voice_dave_host:drive({join, UserId, MaxVersion}, RoomState, Driver),
     {maps:get(version, NewState, 0), NewState}.
 
@@ -97,8 +89,7 @@ negotiate_join(UserBin, MaxVersion, ChIdBin, State) ->
             undefined -> voice_dave_coordinator:new_room_state(false, ChIdBin);
             R -> R
         end,
-    Members = fun() -> maps:keys(maps:get(key_packages, RS0, #{})) end,
-    try drive_join(UserBin, MaxVersion, ChIdBin, RS0, Members) of
+    try drive_join(UserBin, MaxVersion, ChIdBin, RS0) of
         {V, RS1} when is_integer(V) ->
             {ok, V, State#{dave_rooms => Rooms#{ChIdBin => RS1}}};
         Other ->
@@ -114,12 +105,10 @@ negotiate_join(UserBin, MaxVersion, ChIdBin, State) ->
             {error, {Class, Reason}, State}
     end.
 
--spec drive_message(channel_id(), map(), user_id(), voice_dave_coordinator:room_state(), fun(
-    () -> [user_id()]
-)) ->
+-spec drive_message(channel_id(), map(), user_id(), voice_dave_coordinator:room_state()) ->
     voice_dave_coordinator:room_state().
-drive_message(ChannelId, Raw, SenderUserId, RoomState, MemberProvider) ->
-    Driver = build_driver(ChannelId, MemberProvider),
+drive_message(ChannelId, Raw, SenderUserId, RoomState) ->
+    Driver = build_driver(ChannelId),
     case voice_dave_host:normalize_client_message(Raw, SenderUserId) of
         {ok, Event} ->
             voice_dave_host:drive(Event, RoomState, Driver);
@@ -130,20 +119,16 @@ drive_message(ChannelId, Raw, SenderUserId, RoomState, MemberProvider) ->
             RoomState
     end.
 
--spec drive_member_left(channel_id(), user_id(), voice_dave_coordinator:room_state(), fun(
-    () -> [user_id()]
-)) ->
+-spec drive_member_left(channel_id(), user_id(), voice_dave_coordinator:room_state()) ->
     voice_dave_coordinator:room_state().
-drive_member_left(ChannelId, UserId, RoomState, MemberProvider) ->
-    Driver = build_driver(ChannelId, MemberProvider),
+drive_member_left(ChannelId, UserId, RoomState) ->
+    Driver = build_driver(ChannelId),
     voice_dave_host:drive({member_left, UserId}, RoomState, Driver).
 
--spec drive_timer(channel_id(), term(), voice_dave_coordinator:room_state(), fun(
-    () -> [user_id()]
-)) ->
+-spec drive_timer(channel_id(), term(), voice_dave_coordinator:room_state()) ->
     voice_dave_coordinator:room_state().
-drive_timer(ChannelId, Msg, RoomState, MemberProvider) ->
-    Driver = build_driver(ChannelId, MemberProvider),
+drive_timer(ChannelId, Msg, RoomState) ->
+    Driver = build_driver(ChannelId),
     voice_dave_host:drive(Msg, RoomState, Driver).
 
 %% Dispatch a DAVE event to a single user's session. The coordinator keys users
@@ -288,7 +273,7 @@ driver_send_dispatches_integer_uid_test() ->
     meck:new(presence_manager, [passthrough]),
     try
         meck:expect(presence_manager, dispatch_to_user, fun(_, _, _) -> ok end),
-        Driver = build_driver(<<"chan1">>, fun() -> [] end),
+        Driver = build_driver(<<"chan1">>),
         Send = maps:get(send, Driver),
         %% binary snowflake must arrive at presence_manager as an INTEGER
         Send(<<"1000000000000000001">>, #{<<"type">> => <<"welcome">>}),
@@ -307,34 +292,11 @@ driver_send_skips_non_numeric_test() ->
     meck:new(presence_manager, [passthrough]),
     try
         meck:expect(presence_manager, dispatch_to_user, fun(_, _, _) -> ok end),
-        Driver = build_driver(<<"c">>, fun() -> [] end),
+        Driver = build_driver(<<"c">>),
         Send = maps:get(send, Driver),
         Send(<<"not-a-snowflake">>, #{<<"type">> => <<"x">>}),
         %% non-numeric id must never reach presence_manager
         ?assertEqual(0, meck:num_calls(presence_manager, dispatch_to_user, '_'))
-    after
-        meck:unload(presence_manager)
-    end.
-
-driver_broadcast_fans_to_members_test() ->
-    meck:new(presence_manager, [passthrough]),
-    try
-        meck:expect(presence_manager, dispatch_to_user, fun(_, _, _) -> ok end),
-        Members = [<<"111">>, <<"222">>, <<"333">>],
-        Driver = build_driver(<<"ch">>, fun() -> Members end),
-        Broadcast = maps:get(broadcast, Driver),
-        Broadcast(#{<<"type">> => <<"proposals">>}),
-        ?assertEqual(3, meck:num_calls(presence_manager, dispatch_to_user, '_')),
-        lists:foreach(
-            fun(U) ->
-                ?assert(
-                    meck:called(presence_manager, dispatch_to_user, [
-                        U, dave_protocol_event, '_'
-                    ])
-                )
-            end,
-            [111, 222, 333]
-        )
     after
         meck:unload(presence_manager)
     end.
@@ -362,7 +324,7 @@ founding_via_guild_driver_establishes_test() ->
                         <<"welcome_b64">> => <<"W">>
                     }}
             end,
-        Driver0 = build_driver(<<"g_ch">>, fun() -> [] end),
+        Driver0 = build_driver(<<"g_ch">>),
         Driver = Driver0#{call_api => CallApi},
         S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
         S1 = voice_dave_host:drive({join, <<"1001">>, 1}, S0, Driver),
@@ -410,7 +372,7 @@ drive_join_returns_negotiated_version_test() ->
             fun(_) -> {ok, #{<<"sender_package_b64">> => <<"S">>}} end
         ),
         S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
-        {Version, S1} = drive_join(<<"1001">>, 1, <<"42">>, S0, fun() -> [] end),
+        {Version, S1} = drive_join(<<"1001">>, 1, <<"42">>, S0),
         ?assertEqual(1, Version),
         ?assertEqual(1, maps:get(version, S1))
     after
@@ -437,8 +399,7 @@ drive_message_normalizes_and_drives_test() ->
             <<"ch">>,
             #{<<"type">> => <<"key_package">>, <<"data">> => <<"KP">>},
             <<"1001">>,
-            S0,
-            fun() -> [] end
+            S0
         ),
         %% key_package on an unestablished room creates an add transition
         ?assert(maps:get(transition, S1, undefined) =/= undefined)
@@ -450,7 +411,7 @@ drive_message_normalizes_and_drives_test() ->
 drive_message_unknown_type_is_noop_test() ->
     RoomState = voice_dave_coordinator:new_room_state(false, <<"42">>),
     Result = drive_message(
-        <<"ch">>, #{<<"type">> => <<"garbage">>}, <<"1001">>, RoomState, fun() -> [] end
+        <<"ch">>, #{<<"type">> => <<"garbage">>}, <<"1001">>, RoomState
     ),
     ?assertEqual(RoomState, Result).
 
