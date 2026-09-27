@@ -92,6 +92,14 @@ export class DaveClient {
 	 * away instead of pending forever.
 	 */
 	private externalSenderB64: string | null = null;
+	/**
+	 * Proposals bundle held because it adds a user the local roster has not
+	 * recognized yet (the gateway's MLS state can run ahead of LiveKit
+	 * participant delivery). recognizeUser() retries automatically.
+	 */
+	private deferredProposalsB64: string | null = null;
+	private processingProposals = false;
+	private deferredProposalReason = '';
 	private destroyed = false;
 
 	constructor(params: CreateDaveClientParams) {
@@ -103,6 +111,14 @@ export class DaveClient {
 		this.instanceKey = params.instanceKey ?? params.channelId;
 		this.transientKeys = new this.mod.TransientKeys();
 		this.session = new this.mod.Session('', '', (source: string, reason: string) => {
+			// A proposal naming a user we have not recognized yet is a benign
+			// roster race, not a security break: hold the bundle instead of
+			// failing closed, so the commit fires as soon as the peer's
+			// identity arrives.
+			if (this.processingProposals && source === 'ValidateProposalMessage' && reason.includes('Unexpected user ID')) {
+				this.deferredProposalReason = `${source}: ${reason}`;
+				return;
+			}
 			// MLS failure callback: log the diagnostics and mark the session
 			// failed; the coordinator drives recovery via prepare_epoch.
 			console.error(`[dave] MLS failure: ${source}: ${reason}`, {channelId: this.channelId});
@@ -131,6 +147,7 @@ export class DaveClient {
 	public recognizeUser(userId: string): void {
 		this.recognizedUserIds.add(userId);
 		this.setupKeyRatchetForUser(userId, this.latestPreparedTransitionVersion);
+		this.maybeRetryDeferredProposals();
 	}
 
 	public forgetUser(userId: string): void {
@@ -200,6 +217,7 @@ export class DaveClient {
 
 	public destroy(): void {
 		this.destroyed = true;
+		this.deferredProposalsB64 = null;
 		this.transientKeys.Clear();
 		try {
 			this.session.delete();
@@ -245,11 +263,35 @@ export class DaveClient {
 	}
 
 	private handleProposals(proposalsB64: string): void {
-		const proposals = decodeBytes(proposalsB64);
-		const commitWelcome = this.session.ProcessProposals(proposals, this.getRecognizedUserIDs());
+		this.processingProposals = true;
+		this.deferredProposalReason = '';
+		let commitWelcome: unknown;
+		try {
+			commitWelcome = this.session.ProcessProposals(decodeBytes(proposalsB64), this.getRecognizedUserIDs());
+		} finally {
+			this.processingProposals = false;
+		}
+		if (this.deferredProposalReason) {
+			this.deferredProposalsB64 = proposalsB64;
+			console.warn(`[dave] proposals deferred (${this.deferredProposalReason}); waiting for peer recognition`, {
+				channelId: this.channelId
+			});
+			return;
+		}
+		this.deferredProposalsB64 = null;
 		if (commitWelcome) {
 			this.send({type: 'commit_welcome', data: encodeBytes(commitWelcome as number[])});
 		}
+	}
+
+	private maybeRetryDeferredProposals(): void {
+		const held = this.deferredProposalsB64;
+		if (held === null || this.destroyed) {
+			return;
+		}
+		this.deferredProposalsB64 = null;
+		console.info('[dave] retrying deferred proposals after roster update', {channelId: this.channelId});
+		this.handleProposals(held);
 	}
 
 	private handleAnnounceCommit(transitionId: number, commitB64: string): void {
