@@ -150,8 +150,12 @@ handle_call_request({update_voice_state, UserId, VoiceState}, State) ->
 handle_call_request({get_sessions}, State) ->
     handle_get_sessions(State);
 handle_call_request({dave_negotiate, UserBin, MaxVersion}, State) ->
-    {Version, NewState} = call_dave:negotiate_join(UserBin, MaxVersion, State),
-    {reply, {ok, Version}, NewState};
+    case call_dave:negotiate_join(UserBin, MaxVersion, State) of
+        {ok, Version, NewState} ->
+            {reply, {ok, Version}, NewState};
+        {error, _Reason, NewState} ->
+            {reply, {error, dave_negotiation_failed}, NewState}
+    end;
 handle_call_request({dave_message, SenderBin, Raw}, State) ->
     {reply, ok, call_dave:handle_message(Raw, SenderBin, State)};
 handle_call_request({get_pending_connections}, State) ->

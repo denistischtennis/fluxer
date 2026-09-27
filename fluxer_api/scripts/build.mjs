@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import {readFileSync, rmSync} from 'node:fs';
+import {copyFileSync, existsSync, readFileSync, rmSync} from 'node:fs';
 import {isBuiltin} from 'node:module';
 import {dirname, join, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -56,6 +56,16 @@ await build({
 	banner: {js: '// SPDX-License-Identifier: AGPL-3.0-or-later'},
 	plugins: [workspacePlugin],
 });
+
+// The wasm-node glue locates libdave.wasm relative to its own module at
+// runtime (scriptDirectory = dirname(import.meta.url)). esbuild bundles the
+// JS glue into the worker but cannot inline the binary, so copy it next to
+// the emitted worker bundle at dist/api/voice/dave/.
+const wasmSource = resolve(API_ROOT, '..', 'packages', 'libdave', 'wasm-node', 'libdave.wasm');
+if (!existsSync(wasmSource)) {
+	throw new Error(`DAVE wasm not found at ${wasmSource}; build packages/libdave first.`);
+}
+copyFileSync(wasmSource, join(OUT_DIR, 'api', 'voice', 'dave', 'libdave.wasm'));
 
 if (undeclaredDependencies.size > 0) {
 	const names = [...undeclaredDependencies].sort().join(', ');

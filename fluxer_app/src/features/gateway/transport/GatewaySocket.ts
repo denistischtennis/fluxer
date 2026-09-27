@@ -73,7 +73,7 @@ export interface GatewaySocketProperties {
 	desktop_app_channel?: string | null;
 	desktop_arch?: string | null;
 	desktop_os?: string | null;
-	e2ee_capable?: boolean;
+	dave_max_version?: number;
 	latitude?: string;
 	longitude?: string;
 }

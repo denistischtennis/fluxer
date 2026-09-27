@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024 LiveKit, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
-import {Encryption_Type, type TrackInfo} from '@livekit/protocol';
+import {type TrackInfo} from '@livekit/protocol';
 import {EventEmitter} from 'events';
 import type TypedEventEmitter from 'typed-emitter';
 import type {FrameMetadata} from '../frameMetadata/types.ts';
@@ -10,15 +10,13 @@ import {getLogger, LoggerNames, type LogLevel, onWorkerLogLevelChanged, workerLo
 import {DeviceUnsupportedError} from '../room/errors.ts';
 import {EngineEvent, ParticipantEvent, RoomEvent} from '../room/events.ts';
 import type Room from '../room/Room.ts';
-import {ConnectionState} from '../room/Room.ts';
 import type RTCEngine from '../room/RTCEngine.ts';
 import type {TrackPublishOptions, VideoCodec} from '../room/track/options.ts';
 import type RemoteTrack from '../room/track/RemoteTrack.ts';
 import RemoteVideoTrack from '../room/track/RemoteVideoTrack.ts';
 import type {Track} from '../room/track/Track.ts';
-import type {TrackPublication} from '../room/track/TrackPublication.ts';
 import {mimeTypeToVideoCodecString} from '../room/track/utils.ts';
-import {Future, isLocalTrack, isSafariBased, isScriptTransformSupportedForWorker, isVideoTrack} from '../room/utils.ts';
+import {Future, isLocalTrack, isScriptTransformSupportedForWorker, isVideoTrack} from '../room/utils.ts';
 import type {NonSharedUint8Array} from '../type-polyfills/non-shared-typed-arrays.ts';
 import {E2EE_FLAG, E2EE_TRACK_ID, KEY_PROVIDER_DEFAULTS} from './constants.ts';
 import {CryptorError, CryptorErrorReason} from './errors.ts';
@@ -38,7 +36,6 @@ import type {
 	EncryptDataResponseMessage,
 	InitMessage,
 	KeyInfo,
-	RatchetRequestMessage,
 	RemoveTransformMessage,
 	RTPVideoMapMessage,
 	ScriptTransformOptions,
@@ -73,7 +70,7 @@ export interface BaseE2EEManager {
 	/** DAVE: toggle passthrough for a participant (version-0 / pre-transition). */
 	setParticipantPassthrough(participantIdentity: string, enabled: boolean, transitionExpiryMs?: number): void;
 	/** DAVE: map an outbound track's synthetic SSRC to its codec. */
-	assignTrackCodec(participantIdentity: string, ssrc: number, codec: number): void;
+	assignTrackCodec(participantIdentity: string, trackId: string, ssrc: number, codec: number): void;
 }
 
 export class E2EEManager
@@ -88,7 +85,7 @@ export class E2EEManager
 
 	private keyProvider: BaseKeyProvider | undefined;
 
-	private mode: 'sharedkey' | 'dave';
+	private mode: 'dave';
 
 	private decryptDataRequests: Map<string, Future<DecryptDataResponseMessage['data'], Error>> = new Map();
 
@@ -117,7 +114,7 @@ export class E2EEManager
 	constructor(options: E2EEManagerOptions, dcEncryptionEnabled: boolean) {
 		super();
 		this.keyProvider = options.keyProvider;
-		this.mode = options.mode ?? 'sharedkey';
+		this.mode = options.mode ?? 'dave';
 		this.worker = options.worker;
 		this.encryptionEnabled = false;
 		this.dataChannelEncryptionEnabled = dcEncryptionEnabled;
@@ -138,14 +135,11 @@ export class E2EEManager
 		this.log.info('setting up e2ee');
 		if (room !== this.room) {
 			this.room = room;
-			const isDave = this.mode === 'dave';
-			if (!isDave && this.keyProvider) {
-				this.setupEventListeners(room, this.keyProvider);
-			}
+			this.setupDaveEventListeners(room);
 			const msg: InitMessage = {
 				kind: 'init',
 				data: {
-					keyProviderOptions: isDave ? KEY_PROVIDER_DEFAULTS : this.keyProvider!.getOptions(),
+					keyProviderOptions: KEY_PROVIDER_DEFAULTS,
 					loglevel: workerLogger.getLevel() as LogLevel,
 					mode: this.mode,
 				},
@@ -331,75 +325,26 @@ export class E2EEManager
 		});
 	}
 
-	private setupEventListeners(room: Room, keyProvider: BaseKeyProvider) {
-		room.on(RoomEvent.TrackPublished, (pub, participant) =>
-			this.setParticipantCryptorEnabledForPublication(pub, participant.identity),
-		);
-		room
-			.on(RoomEvent.ConnectionStateChanged, (state) => {
-				if (state === ConnectionState.Connected) {
-					room.remoteParticipants.forEach((participant) => {
-						participant.trackPublications.forEach((pub) => {
-							this.setParticipantCryptorEnabledForPublication(pub, participant.identity);
-						});
-					});
-				}
-			})
-			.on(RoomEvent.TrackUnsubscribed, (track, _, participant) => {
-				const msg: RemoveTransformMessage = {
-					kind: 'removeTransform',
-					data: {
-						participantIdentity: participant.identity,
-						trackId: track.mediaStreamID,
-					},
-				};
-				this.worker?.postMessage(msg);
-			})
-			.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
-				this.setupE2EEReceiver(track, participant.identity, pub.trackInfo);
-			})
-			.on(RoomEvent.SignalConnected, () => {
-				if (!this.room) {
-					throw new TypeError(`expected room to be present on signal connect`);
-				}
-				const latestKeyIndex = keyProvider.getLatestManuallySetKeyIndex();
-				keyProvider.getKeys().forEach((keyInfo) => {
-					this.postKey(keyInfo, latestKeyIndex === (keyInfo.keyIndex ?? 0));
-				});
-				this.setParticipantCryptorEnabled(
-					this.room.localParticipant.isE2EEEnabled,
-					this.room.localParticipant.identity,
-				);
-			});
-
+	private setupDaveEventListeners(room: Room) {
+		// In DAVE mode the worker routes every encode/decode transform through the
+		// libdave-backed cryptors; these listeners ensure each local sender and each
+		// subscribed remote receiver actually gets its transform installed.
+		room.on(RoomEvent.TrackUnsubscribed, (track, _, participant) => {
+			const msg: RemoveTransformMessage = {
+				kind: 'removeTransform',
+				data: {
+					participantIdentity: participant.identity,
+					trackId: track.mediaStreamID,
+				},
+			};
+			this.worker?.postMessage(msg);
+		});
+		room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+			this.setupE2EEReceiver(track, participant.identity, pub.trackInfo);
+		});
 		room.localParticipant.on(ParticipantEvent.LocalSenderCreated, async (sender, track, codec, trackId) => {
 			this.setupE2EESender(track, sender, codec, trackId);
 		});
-
-		room.localParticipant.on(ParticipantEvent.LocalTrackPublished, (publication) => {
-			if (!isVideoTrack(publication.track) || !isSafariBased()) {
-				return;
-			}
-			const msg: UpdateCodecMessage = {
-				kind: 'updateCodec',
-				data: {
-					trackId: publication.track!.mediaStreamID,
-					codec: mimeTypeToVideoCodecString(publication.trackInfo!.codecs[0].mimeType),
-					participantIdentity: this.room!.localParticipant.identity,
-					hasPacketTrailer: false,
-				},
-			};
-
-			this.worker.postMessage(msg);
-		});
-
-		keyProvider
-			.on(KeyProviderEvent.SetKey, (keyInfo, updateCurrentKeyIndex) =>
-				this.postKey(keyInfo, updateCurrentKeyIndex ?? true),
-			)
-			.on(KeyProviderEvent.RatchetRequest, (participantId, keyIndex) =>
-				this.postRatchetRequest(participantId, keyIndex),
-			);
 	}
 	/**
 	 * Push a peer's (or self's) DAVE key ratchet into the worker. Called by the
@@ -410,9 +355,10 @@ export class E2EEManager
 		ratchet: {cipherSuite: number; baseSecret: number[]} | null,
 		transitionExpiryMs?: number,
 	): void {
+		const isLocal = participantIdentity === this.room?.localParticipant.identity;
 		const msg: DaveSetRatchetMessage = {
 			kind: 'daveSetRatchet',
-			data: {participantIdentity, ratchet, transitionExpiryMs},
+			data: {participantIdentity, isLocal, ratchet, transitionExpiryMs},
 		};
 		this.worker?.postMessage(msg);
 	}
@@ -431,10 +377,10 @@ export class E2EEManager
 	}
 
 	/** Map an outbound track's synthetic SSRC to its DAVE codec. */
-	assignTrackCodec(participantIdentity: string, ssrc: number, codec: number): void {
+	assignTrackCodec(participantIdentity: string, trackId: string, ssrc: number, codec: number): void {
 		const msg: DaveAssignCodecMessage = {
 			kind: 'daveAssignCodec',
-			data: {participantIdentity, ssrc, codec},
+			data: {participantIdentity, trackId, ssrc, codec},
 		};
 		this.worker?.postMessage(msg);
 	}
@@ -488,20 +434,6 @@ export class E2EEManager
 		this.decryptDataRequests.set(uuid, future);
 		this.worker.postMessage(msg);
 		return future.promise;
-	}
-
-	private postRatchetRequest(participantIdentity?: string, keyIndex?: number) {
-		if (!this.worker) {
-			throw Error('could not ratchet key, worker is missing');
-		}
-		const msg: RatchetRequestMessage = {
-			kind: 'ratchetRequest',
-			data: {
-				participantIdentity: participantIdentity,
-				keyIndex,
-			},
-		};
-		this.worker.postMessage(msg);
 	}
 
 	private postKey({key, participantIdentity, keyIndex}: KeyInfo, updateCurrentKeyIndex: boolean) {
@@ -564,16 +496,6 @@ export class E2EEManager
 			},
 		};
 		this.worker.postMessage(msg);
-	}
-
-	private setParticipantCryptorEnabledForPublication(pub: TrackPublication, participantIdentity: string) {
-		if (!pub.trackInfo) {
-			this.log.warn('skipping e2ee enabled update for publication without trackInfo', {
-				trackSid: pub.trackSid,
-			});
-			return;
-		}
-		this.setParticipantCryptorEnabled(pub.trackInfo.encryption !== Encryption_Type.NONE, participantIdentity);
 	}
 
 	private setupE2EEReceiver(track: RemoteTrack, remoteId: string, trackInfo?: TrackInfo) {

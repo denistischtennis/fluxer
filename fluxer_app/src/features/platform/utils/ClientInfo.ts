@@ -8,7 +8,6 @@ import {getFluxerDebugObject} from '@app/features/platform/utils/FluxerDebugGlob
 import {getElectronAPI, isDesktop} from '@app/features/ui/utils/NativeUtils';
 import type {DesktopInfo} from '@app/types/electron.d';
 import Bowser from 'bowser';
-import {isE2EESupported} from 'livekit-client';
 
 const logger = new Logger('ClientInfoUtils');
 
@@ -352,39 +351,72 @@ export function installFluxerConfigDebugApi(): void {
 	}
 }
 
-function isLiveKitE2EECapable(): boolean {
-	if (typeof window === 'undefined' || typeof Worker === 'undefined') {
-		return false;
-	}
-	if (!globalThis.crypto?.subtle) {
-		return false;
-	}
+const DAVE_MAX_VERSION_STORAGE_KEY = 'fluxer:dave_max_version';
+
+let daveCapabilityPromise: Promise<number> | null = null;
+
+function readDaveMaxVersionCache(): number | null {
 	try {
-		return isE2EESupported();
-	} catch (error) {
-		logger.warn('Failed to detect LiveKit E2EE support', error);
-		return false;
+		const raw = sessionStorage.getItem(DAVE_MAX_VERSION_STORAGE_KEY);
+		if (raw === null) {
+			return null;
+		}
+		const parsed = Number.parseInt(raw, 10);
+		return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+	} catch {
+		return null;
 	}
 }
 
-let daveVersionPromise: Promise<number> | null = null;
-
 /**
- * Lazily load the libdave WASM once and read its max supported DAVE protocol
- * version. Returns 0 when the module cannot be loaded (no WASM support, CSP
- * block, etc.) so the caller degrades to non-DAVE. Cached across calls.
+ * Load the libdave WASM once OFF the identify hot path (kicked off at app
+ * boot) and cache the max supported DAVE protocol version in a module
+ * variable plus sessionStorage, so later page loads answer synchronously. A
+ * failed load is logged loudly and cached as 0 for this session instead of
+ * silently misreporting capability on every identify.
  */
-export function getDaveMaxVersion(): Promise<number> {
+export function preloadDaveCapability(): Promise<number> {
 	if (typeof window === 'undefined' || typeof Worker === 'undefined') {
 		return Promise.resolve(0);
 	}
-	if (daveVersionPromise === null) {
-		daveVersionPromise = import('@fluxer/libdave/wasm')
-			.then(({DaveModuleFactory}) => DaveModuleFactory())
-			.then((mod) => mod.MaxSupportedProtocolVersion() as number)
-			.catch(() => 0);
+	if (daveCapabilityPromise === null) {
+		const cached = readDaveMaxVersionCache();
+		if (cached !== null) {
+			daveCapabilityPromise = Promise.resolve(cached);
+		} else {
+			daveCapabilityPromise = import('@fluxer/libdave/wasm')
+				.then(({DaveModuleFactory}) => DaveModuleFactory())
+				.then((mod) => {
+					const version = mod.MaxSupportedProtocolVersion() as number;
+					try {
+						sessionStorage.setItem(DAVE_MAX_VERSION_STORAGE_KEY, String(version));
+					} catch {
+						/* storage disabled; the module cache still holds the value */
+					}
+					return version;
+				})
+				.catch((error) => {
+					logger.error('Failed to load libdave WASM; DAVE capability will be reported as 0', error);
+					return 0;
+				});
+		}
 	}
-	return daveVersionPromise;
+	return daveCapabilityPromise;
+}
+
+/**
+ * Max supported DAVE protocol version. Served from the boot-time preload /
+ * sessionStorage cache when available; otherwise the caller awaits the same
+ * single-flight preload (started at app boot, so identify is never blocked in
+ * practice). Capability is never silently reported as zero before the load
+ * actually fails.
+ */
+export function getDaveMaxVersion(): Promise<number> {
+	const cached = readDaveMaxVersionCache();
+	if (cached !== null) {
+		return Promise.resolve(cached);
+	}
+	return preloadDaveCapability();
 }
 
 export async function getGatewayClientProperties(geo?: {latitude?: string | null; longitude?: string | null}) {
@@ -403,7 +435,6 @@ export async function getGatewayClientProperties(geo?: {latitude?: string | null
 		desktop_app_channel: info.desktopChannel ?? null,
 		desktop_arch: info.desktopArch ?? info.arch ?? null,
 		desktop_os: info.desktopOS ?? info.osName ?? null,
-		e2ee_capable: isLiveKitE2EECapable(),
 		dave_max_version: await getDaveMaxVersion(),
 		...(geo?.latitude ? {latitude: geo.latitude} : {}),
 		...(geo?.longitude ? {longitude: geo.longitude} : {}),

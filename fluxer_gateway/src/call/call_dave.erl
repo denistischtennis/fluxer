@@ -40,11 +40,11 @@ room(State) ->
 %% Returns the negotiated protocol version (`null' when the call has no usable
 %% channel id, which cannot happen for a live call but is handled defensively).
 -spec negotiate_join(user_id(), non_neg_integer(), call_state()) ->
-    {non_neg_integer() | null, call_state()}.
+    {ok, non_neg_integer(), call_state()} | {error, term(), call_state()}.
 negotiate_join(UserBin, MaxVersion, State) ->
     case channel_key_safe(State) of
         {ok, ChIdBin} -> guild_voice_dave:negotiate_join(UserBin, MaxVersion, ChIdBin, State);
-        error -> {null, State}
+        error -> {error, no_channel_id, State}
     end.
 
 %% Drive an inbound opcode-17 message from a call participant.
@@ -136,7 +136,7 @@ channel_key_safe_accepts_integer_and_binary_channel_ids_test() ->
     ?assertEqual(error, channel_key_safe(#{channel_id => <<>>})).
 
 missing_channel_id_is_not_negotiable_test() ->
-    ?assertEqual({null, #{region => x}}, negotiate_join(<<"1">>, 1, #{region => x})),
+    ?assertEqual({error, no_channel_id, #{region => x}}, negotiate_join(<<"1">>, 1, #{region => x})),
     ?assertEqual(error, channel_key_safe(#{})).
 
 room_absent_until_first_write_test() ->
@@ -157,7 +157,7 @@ negotiate_join_stores_room_impl() ->
             call,
             fun(_) -> {ok, #{<<"data">> => #{<<"sender_package_b64">> => <<"S">>}}} end
         ),
-        {Version, NewState} = negotiate_join(<<"1001">>, 1, #{channel_id => 555}),
+        {ok, Version, NewState} = negotiate_join(<<"1001">>, 1, #{channel_id => 555}),
         ?assertEqual(1, Version),
         Room = room(NewState),
         ?assert(is_map(Room)),

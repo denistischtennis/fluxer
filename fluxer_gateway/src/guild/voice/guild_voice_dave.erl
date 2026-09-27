@@ -13,7 +13,7 @@
 
 -export([
     build_driver/2,
-    drive_join/4,
+    drive_join/5,
     negotiate_join/4,
     drive_message/5,
     drive_member_left/4,
@@ -69,12 +69,15 @@ build_driver(ChannelId, MemberProvider) ->
 %% the updated state. `MemberProvider' supplies current channel member ids for
 %% broadcast fan-out.
 %% --------------------------------------------------------------------------
--spec drive_join(user_id(), non_neg_integer(), voice_dave_coordinator:room_state(), fun(
+-spec drive_join(user_id(), non_neg_integer(), channel_id(), voice_dave_coordinator:room_state(), fun(
     () -> [user_id()]
 )) ->
     {non_neg_integer(), voice_dave_coordinator:room_state()}.
-drive_join(UserId, MaxVersion, RoomState, MemberProvider) ->
-    Driver = build_driver(<<>>, MemberProvider),
+drive_join(UserId, MaxVersion, ChannelId, RoomState, MemberProvider) ->
+    %% The channel id must ride along on every downlink event; the client drops
+    %% DAVE_PROTOCOL_EVENTs without a usable channel_id, so passing <<>> here
+    %% would silently kill the join handshake.
+    Driver = build_driver(ChannelId, MemberProvider),
     NewState = voice_dave_host:drive({join, UserId, MaxVersion}, RoomState, Driver),
     {maps:get(version, NewState, 0), NewState}.
 
@@ -86,26 +89,29 @@ drive_join(UserId, MaxVersion, RoomState, MemberProvider) ->
 %% Returns the negotiated protocol version plus the updated owning state.
 %% --------------------------------------------------------------------------
 -spec negotiate_join(user_id(), non_neg_integer(), channel_id(), map()) ->
-    {non_neg_integer() | null, map()}.
+    {ok, non_neg_integer(), map()} | {error, term(), map()}.
 negotiate_join(UserBin, MaxVersion, ChIdBin, State) ->
     Rooms = maps:get(dave_rooms, State, #{}),
     RS0 =
         case maps:get(ChIdBin, Rooms, undefined) of
-            undefined -> voice_dave_coordinator:new_room_state(false);
+            undefined -> voice_dave_coordinator:new_room_state(false, ChIdBin);
             R -> R
         end,
     Members = fun() -> maps:keys(maps:get(key_packages, RS0, #{})) end,
-    try drive_join(UserBin, MaxVersion, RS0, Members) of
-        {V, RS1} ->
-            {V, State#{dave_rooms => Rooms#{ChIdBin => RS1}}};
-        _ ->
-            {1, State}
+    try drive_join(UserBin, MaxVersion, ChIdBin, RS0, Members) of
+        {V, RS1} when is_integer(V) ->
+            {ok, V, State#{dave_rooms => Rooms#{ChIdBin => RS1}}};
+        Other ->
+            ?LOG_WARNING("dave join returned unexpected result", #{
+                channel_id => ChIdBin, result => Other
+            }),
+            {error, {unexpected_result, Other}, State}
     catch
         Class:Reason ->
             ?LOG_WARNING("dave join trigger failed", #{
                 channel_id => ChIdBin, class => Class, reason => Reason
             }),
-            {1, State}
+            {error, {Class, Reason}, State}
     end.
 
 -spec drive_message(channel_id(), map(), user_id(), voice_dave_coordinator:room_state(), fun(
@@ -340,6 +346,8 @@ founding_via_guild_driver_establishes_test() ->
             fun
                 (sender_package, _) ->
                     {ok, #{<<"sender_package_b64">> => <<"SENDER">>}};
+                (validate_key_package, _) ->
+                    {ok, #{<<"valid">> => true, <<"reason">> => <<>>}};
                 (create_proposals, _) ->
                     {ok, #{<<"proposals_b64">> => <<"PROPS">>}};
                 (parse_commit, _) ->
@@ -353,7 +361,7 @@ founding_via_guild_driver_establishes_test() ->
             end,
         Driver0 = build_driver(<<"g_ch">>, fun() -> [] end),
         Driver = Driver0#{call_api => CallApi},
-        S0 = voice_dave_coordinator:new_room_state(false),
+        S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
         S1 = voice_dave_host:drive({join, <<"1001">>, 1}, S0, Driver),
         S2 = voice_dave_host:drive({key_package, <<"1001">>, <<"KPA">>}, S1, Driver),
         S3 = voice_dave_host:drive({commit_welcome, <<"1001">>, <<"BUNDLE">>}, S2, Driver),
@@ -398,8 +406,8 @@ drive_join_returns_negotiated_version_test() ->
             call,
             fun(_) -> {ok, #{<<"data">> => #{<<"sender_package_b64">> => <<"S">>}}} end
         ),
-        S0 = voice_dave_coordinator:new_room_state(false),
-        {Version, S1} = drive_join(<<"1001">>, 1, S0, fun() -> [] end),
+        S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
+        {Version, S1} = drive_join(<<"1001">>, 1, <<"42">>, S0, fun() -> [] end),
         ?assertEqual(1, Version),
         ?assertEqual(1, maps:get(version, S1))
     after
@@ -415,9 +423,13 @@ drive_message_normalizes_and_drives_test() ->
         meck:expect(
             rpc_client,
             call,
-            fun(_) -> {ok, #{<<"data">> => #{<<"proposals_b64">> => <<"P">>}}} end
+            fun(_) ->
+                {ok, #{<<"data">> => #{<<"proposals_b64">> => <<"P">>, <<"valid">> => true}}}
+            end
         ),
-        S0 = voice_dave_coordinator:new_room_state(false),
+        S0 = (voice_dave_coordinator:new_room_state(false, <<"42">>))#{
+            joined => #{<<"1001">> => true}
+        },
         S1 = drive_message(
             <<"ch">>,
             #{<<"type">> => <<"key_package">>, <<"data">> => <<"KP">>},
@@ -433,7 +445,7 @@ drive_message_normalizes_and_drives_test() ->
     end.
 
 drive_message_unknown_type_is_noop_test() ->
-    RoomState = voice_dave_coordinator:new_room_state(false),
+    RoomState = voice_dave_coordinator:new_room_state(false, <<"42">>),
     Result = drive_message(
         <<"ch">>, #{<<"type">> => <<"garbage">>}, <<"1001">>, RoomState, fun() -> [] end
     ),

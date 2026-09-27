@@ -610,11 +610,11 @@ export const RpcResponse = z.discriminatedUnion('type', [
 				ok: z.boolean().describe('Whether the commit was accepted'),
 				reason: createStringType(0, 512).optional().describe('Rejection reason when not ok'),
 				new_epoch: z.number().int().min(0).optional().describe('Epoch after the commit'),
-				committer_user_id: SnowflakeType.optional().describe('Derived committer user ID'),
+				committer_user_id: SnowflakeStringType.optional().describe('Derived committer user ID'),
 				roster: z
 					.array(
 						z.object({
-							user_id: SnowflakeType.describe('Roster member user ID'),
+							user_id: SnowflakeStringType.describe('Roster member user ID'),
 							leaf_index: z.number().int().min(0).describe('Roster member leaf index'),
 						}),
 					)

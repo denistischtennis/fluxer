@@ -5,6 +5,8 @@
 -typing([eqwalizer]).
 
 -include_lib("fluxer_gateway/include/voice_state.hrl").
+-include_lib("kernel/include/logger.hrl").
+
 
 -export([handle_new_connection/5]).
 
@@ -205,7 +207,7 @@ build_new_voice_state(Build) ->
     }),
     State2 = guild_voice_connection_pending:store_pending(ConnectionId, PendingMetadata, State),
     DaveEnabled = guild_voice_e2ee:context_e2ee_capable_guild(Context, State2),
-    {DaveVersion, State3} =
+    Negotiation =
         case DaveEnabled of
             true ->
                 guild_voice_dave:negotiate_join(
@@ -215,18 +217,52 @@ build_new_voice_state(Build) ->
                     State2
                 );
             false ->
-                {null, State2}
+                {ok, null, State2}
         end,
-    {reply,
-        #{
-            success => true,
-            token => Token,
-            endpoint => Endpoint,
-            connection_id => ConnectionId,
-            dave_version => DaveVersion,
-            voice_state => voice_state_utils:external_voice_state(VoiceState)
-        },
-        State3}.
+    case Negotiation of
+        {ok, DaveVersion, State3} ->
+            {reply,
+                #{
+                    success => true,
+                    token => Token,
+                    endpoint => Endpoint,
+                    connection_id => ConnectionId,
+                    dave_version => DaveVersion,
+                    voice_state => voice_state_utils:external_voice_state(VoiceState)
+                },
+                State3};
+        {error, Reason, State3} ->
+            %% Fail closed. If the channel already runs an E2EE-active crowd, a
+            %% member whose DAVE negotiation failed must not be admitted: it
+            %% would sit in the room without working end-to-end crypto.
+            ChInt = to_channel_int(ChannelIdValue),
+            VoiceStates = maps:get(voice_states, State3, #{}),
+            case guild_voice_e2ee:channel_is_e2ee_active(ChInt, VoiceStates) of
+                true ->
+                    ?LOG_WARNING("dave join negotiation failed in e2ee-active channel; refusing join", #{
+                        channel_id => ChInt, reason => Reason
+                    }),
+                    {reply, gateway_errors:error(voice_e2ee_required), State3};
+                false ->
+                    ?LOG_WARNING("dave join negotiation failed; joining without dave", #{
+                        channel_id => ChInt, reason => Reason
+                    }),
+                    {reply,
+                        #{
+                            success => true,
+                            token => Token,
+                            endpoint => Endpoint,
+                            connection_id => ConnectionId,
+                            dave_version => null,
+                            voice_state => voice_state_utils:external_voice_state(VoiceState)
+                        },
+                        State3}
+            end
+    end.
+
+-spec to_channel_int(integer() | binary()) -> integer().
+to_channel_int(V) when is_integer(V) -> V;
+to_channel_int(V) when is_binary(V) -> binary_to_integer(V).
 
 -spec voice_build_fields(map()) -> map().
 voice_build_fields(Build) ->

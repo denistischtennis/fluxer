@@ -81,7 +81,9 @@ drive(Event, RoomState, Driver) ->
             case CallApi(Method, Args) of
                 {ok, Result} ->
                     drive(rpc_event(Method, Ref, Result), AccRS, Driver);
-                {error, _Reason} ->
+                {error, Reason} ->
+                    Warn = maps:get(warn, Driver),
+                    Warn({dave_rpc_failed, Method, Reason}),
                     AccRS
             end
         end,
@@ -155,7 +157,15 @@ rpc_event(parse_commit, _Ref, #{<<"ok">> := true} = Result) ->
 rpc_event(parse_commit, _Ref, #{<<"ok">> := false} = Result) ->
     {commit_parsed, error, maps:get(<<"reason">>, Result, undefined)};
 rpc_event(validate_key_package, {_Ref, UserId}, Result) ->
-    {validate_key_package_result, UserId, Result}.
+    %% The API returns a JSON map with binary keys; normalize to the atom-keyed
+    %% shape the coordinator pattern-matches on. Missing `valid' defaults to
+    %% false so a malformed response can never promote a key package.
+    Valid = case maps:get(<<"valid">>, Result, false) of
+        true -> true;
+        _ -> false
+    end,
+    Reason = maps:get(<<"reason">>, Result, <<>>),
+    {validate_key_package_result, UserId, #{valid => Valid, reason => Reason}}.
 
 %% Translate the API's parse-commit JSON into the coordinator's parsed map shape.
 decode_parsed(Result) ->
@@ -253,7 +263,7 @@ normalize_unknown_test() ->
 founding_drives_join_then_sender_package_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
-    S0 = voice_dave_coordinator:new_room_state(false),
+    S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     %% Join triggers select_protocol_ack + a sender_package RPC.
     S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
     Recorded1 = get_recorded(Rec),
@@ -269,13 +279,26 @@ founding_drives_join_then_sender_package_test() ->
     ?assert(lists:member({send, <<"1001">>, #{type => <<"external_sender_package">>, data => <<"SENDER">>}}, Recorded2)),
     ok.
 
-%% Key package arrival on an unestablished room creates add-proposals RPC.
+%% Key package arrival requests DS validation first; only after a valid result
+%% does the add-proposals RPC fire.
 key_package_triggers_create_proposals_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
-    S0 = voice_dave_coordinator:new_room_state(false),
+    S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
     S2 = apply_event({key_package, <<"1001">>, <<"KP1">>}, S1, Ctx),
+    Recorded1 = get_recorded(Rec),
+    ?assert(lists:any(
+        fun({rpc, validate_key_package, Args, _}) ->
+            maps:get(key_package_b64, Args) =:= <<"KP1">> andalso
+                maps:get(user_id, Args) =:= <<"1001">>;
+           (_) ->
+            false
+        end,
+        Recorded1
+    )),
+    ?assertEqual(#{}, maps:get(key_packages, S2, #{})),
+    S3 = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
     Recorded = get_recorded(Rec),
     ?assert(lists:any(
         fun({rpc, create_proposals, Args, _}) ->
@@ -285,33 +308,41 @@ key_package_triggers_create_proposals_test() ->
         end,
         Recorded
     )),
-    ?assert(maps:get(transition, S2, undefined) =/= undefined),
+    ?assert(maps:get(transition, S3, undefined) =/= undefined),
     ok.
 
 %% proposals_created relays proposals to targets and flips phase to awaiting_commit.
 proposals_created_broadcasts_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
-    S0 = voice_dave_coordinator:new_room_state(false),
+    S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
     S2 = apply_event({key_package, <<"1001">>, <<"KP1">>}, S1, Ctx),
-    S3 = apply_event({proposals_created, <<"PROPS">>}, S2, Ctx),
+    S2b = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
+    S3 = apply_event({proposals_created, <<"PROPS">>}, S2b, Ctx),
     Recorded = get_recorded(Rec),
     ?assert(lists:any(fun({broadcast, #{type := <<"proposals">>}}) -> true; (_) -> false end, Recorded)),
     T = maps:get(transition, S3),
     ?assertEqual(awaiting_commit, maps:get(phase, T)),
     ok.
 
-%% invalid_commit_welcome resets to epoch 1 and asks everyone to re-init.
+%% invalid_commit_welcome from an admitted member tears the group down and
+%% asks everyone to re-init. The internal MLS epoch goes to 0 (a fresh
+%% group is founded there); the wire prepare_epoch value 1 means "brand-new
+%% group" per the DAVE op semantics.
 invalid_resets_epoch_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
-    S0 = voice_dave_coordinator:new_room_state(true),
-    S0b = S0#{epoch => 3, key_packages => #{<<"1001">> => <<"KP">>, <<"1002">> => <<"KP2">>}},
+    S0 = voice_dave_coordinator:new_room_state(true, <<"42">>),
+    S0b = S0#{
+        epoch => 3,
+        joined => #{<<"1001">> => true, <<"1002">> => true},
+        key_packages => #{<<"1001">> => <<"KP">>, <<"1002">> => <<"KP2">>}
+    },
     S1 = apply_event({invalid_commit_welcome, <<"1001">>}, S0b, Ctx),
     Recorded = get_recorded(Rec),
     ?assertEqual(false, maps:get(established, S1)),
-    ?assertEqual(1, maps:get(epoch, S1)),
+    ?assertEqual(0, maps:get(epoch, S1)),
     Prepares = [P || {send, _, P} <- Recorded, maps:get(type, P, undefined) =:= <<"prepare_epoch">>],
     ?assertEqual(2, length(Prepares)),
     ok.
@@ -320,7 +351,7 @@ invalid_resets_epoch_test() ->
 member_left_schedules_removal_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
-    S0 = voice_dave_coordinator:new_room_state(true),
+    S0 = voice_dave_coordinator:new_room_state(true, <<"42">>),
     S0b = S0#{
         key_packages => #{<<"1001">> => <<"K1">>, <<"1002">> => <<"K2">>, <<"1003">> => <<"K3">>},
         roster => [
@@ -339,7 +370,7 @@ member_left_schedules_removal_test() ->
 sole_member_reset_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
-    S0 = voice_dave_coordinator:new_room_state(true),
+    S0 = voice_dave_coordinator:new_room_state(true, <<"42">>),
     S0b = S0#{
         key_packages => #{<<"1001">> => <<"K1">>, <<"1002">> => <<"K2">>},
         roster => [
@@ -383,7 +414,7 @@ rpc_event_parse_error_test() ->
 
 rpc_event_validate_test() ->
     ?assertEqual(
-        {validate_key_package_result, <<"7">>, #{<<"valid">> => false}},
+        {validate_key_package_result, <<"7">>, #{valid => false, reason => <<>>}},
         rpc_event(validate_key_package, {make_ref(), <<"7">>}, #{<<"valid">> => false})
     ).
 
@@ -408,6 +439,8 @@ stub_api(sender_package, _Args) ->
     {ok, #{<<"sender_package_b64">> => <<"SENDER">>}};
 stub_api(create_proposals, _Args) ->
     {ok, #{<<"proposals_b64">> => <<"PROPS">>}};
+stub_api(validate_key_package, _Args) ->
+    {ok, #{<<"valid">> => true, <<"reason">> => <<>>}};
 stub_api(parse_commit, _Args) ->
     {ok, #{
         <<"ok">> => true,
@@ -420,7 +453,7 @@ stub_api(parse_commit, _Args) ->
 driving_founding_reaches_established_test() ->
     Rec = new_recorder(),
     Driver = (recording_ctx(Rec))#{call_api => fun stub_api/2},
-    S0 = voice_dave_coordinator:new_room_state(false),
+    S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     %% Join cascades: select_protocol_ack + external_sender_package (via RPC).
     S1 = drive({join, <<"1001">>, 1}, S0, Driver),
     R1 = get_recorded(Rec),
@@ -444,7 +477,7 @@ drive_api_error_halts_test() ->
     Rec = new_recorder(),
     FailApi = fun(sender_package, _) -> {error, down}; (_, _) -> {ok, #{}} end,
     Driver = (recording_ctx(Rec))#{call_api => FailApi},
-    S0 = voice_dave_coordinator:new_room_state(false),
+    S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     _S1 = drive({join, <<"1001">>, 1}, S0, Driver),
     %% ack still sent, but no external_sender_package (RPC failed).
     R1 = get_recorded(Rec),

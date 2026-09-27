@@ -426,8 +426,8 @@ class Room extends (EventEmitter as new () => TypedEmitter<RoomEventCallbacks>) 
 	}
 
 	/** DAVE: map an outbound track's synthetic SSRC to its codec. */
-	assignTrackCodec(participantIdentity: string, ssrc: number, codec: number): void {
-		this.e2eeManager?.assignTrackCodec(participantIdentity, ssrc, codec);
+	assignTrackCodec(participantIdentity: string, trackId: string, ssrc: number, codec: number): void {
+		this.e2eeManager?.assignTrackCodec(participantIdentity, trackId, ssrc, codec);
 	}
 
 	private setupE2EE() {

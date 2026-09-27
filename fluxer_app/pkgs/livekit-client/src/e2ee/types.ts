@@ -19,7 +19,7 @@ export interface InitMessage extends BaseMessage {
 	data: {
 		keyProviderOptions: KeyProviderOptions;
 		loglevel: LogLevel;
-		mode?: 'sharedkey' | 'dave';
+		mode?: 'dave';
 	};
 }
 
@@ -185,6 +185,8 @@ export interface DaveSetRatchetMessage extends BaseMessage {
 	kind: 'daveSetRatchet';
 	data: {
 		participantIdentity: string;
+		/** True when the identity is the local participant (send-side ratchet). */
+		isLocal: boolean;
 		ratchet: {cipherSuite: number; baseSecret: number[]} | null;
 		transitionExpiryMs?: number;
 	};
@@ -203,6 +205,8 @@ export interface DaveAssignCodecMessage extends BaseMessage {
 	kind: 'daveAssignCodec';
 	data: {
 		participantIdentity: string;
+		/** MediaStream ID of the outbound track the SSRC belongs to. */
+		trackId: string;
 		ssrc: number;
 		codec: number;
 	};
@@ -240,7 +244,6 @@ export type RatchetResult = {
 };
 
 export type KeyProviderOptions = {
-	sharedKey: boolean;
 	ratchetSalt: string;
 	ratchetWindowSize: number;
 	failureTolerance: number;
@@ -257,7 +260,7 @@ export type KeyInfo = {
 export type E2EEManagerOptions = {
 	keyProvider?: BaseKeyProvider;
 	worker: Worker;
-	mode?: 'sharedkey' | 'dave';
+	mode?: 'dave';
 };
 
 export type E2EEOptions =

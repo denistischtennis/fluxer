@@ -55,6 +55,36 @@ named Docker volumes (`fluxer-dave-vcpkg-*`); delete them to force a cold rebuil
 Commit the regenerated `wasm-web/` and `wasm-node/` directories together with any
 `cpp/` change. Never hand-edit artefacts.
 
+## Artefact integrity (SHA-256)
+
+| Artefact | SHA-256 |
+|---|---|
+| `wasm-web/libdave.wasm` | `f989f2e9e9d0b29e514082ca40cc706969a0d5dcace3fc5ef22e18e068631e83` |
+| `wasm-node/libdave.wasm` | `25a9cff81a13365062f57f76a30461e65c389df048763e8f1f9318206bfd9c37` |
+
+Rebuilt 2026-09-27 with the hardened delivery bindings (in-order proposal
+application, commit-path leaf verification bound to (group_id, leaf_index),
+prior-occupancy check). The web artefact is byte-identical to the original
+vendored build because `DAVE_DELIVERY=OFF` excludes those bindings from it.
+Verify with `sha256sum wasm-*/libdave.wasm` after every rebuild; update this
+table in the same commit.
+
+## Delivery trust model (known limitation)
+
+`ParseCommitWelcome` validates what a stateless delivery service can validate
+without full MLS verifier state: group/epoch/content-type binding, exact
+coverage of the pending external-proposal set (by ref), committer path
+self-signature under the deployment ciphersuite bound to the sender leaf, and
+prior occupancy of the claimed leaf. It does **not** verify the commit's
+PublicMessage signature or the update-path secrets/parent hashes — that would
+require keeping the full ratchet tree per room in the signer. Forged commits
+that pass these checks are still rejected by every honest client (MLS layer),
+which reports `invalid_commit_welcome` and triggers the coordinator's
+re-founding path; the residual risk is therefore transition churn
+(availability), never confidentiality. If stronger server-side validation
+is ever required, extend the shadow roster with per-leaf signature keys and
+verify the commit signature in `bindings_wasm_delivery.cpp`.
+
 ## Updating from upstream
 
 1. Drop the new upstream `cpp/` over this copy (keep `vcpkg` submodule out), re-apply

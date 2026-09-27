@@ -49,13 +49,14 @@ import type {
 	Room,
 	RoomConnectOptions,
 	RoomOptions,
+	TrackPublication,
 	TrackPublishOptions,
 } from 'livekit-client';
-import {Room as LiveKitRoom, RoomEvent, Track} from 'livekit-client';
+import {ParticipantEvent, Room as LiveKitRoom, RoomEvent, Track} from 'livekit-client';
 import {makeObservable, observableRef} from 'mobx';
 import type {Subscription} from 'rxjs';
 import {timer} from 'rxjs';
-import {DaveClient, type DaveTransport, type DaveKeyRatchet, type DaveDownMessage} from '@fluxer/dave';
+import {codecForTrack, DaveClient, syntheticSsrc, type DaveTransport, type DaveKeyRatchet, type DaveDownMessage} from '@fluxer/dave';
 import GatewayConnection from '@app/features/gateway/transport/GatewayConnection';
 
 const logger = new Logger('VoiceEngineV2AppConnectionHostAdapter');
@@ -114,6 +115,19 @@ const initialHotSwapState: RegionHotSwapState = {
 	inProgress: false,
 };
 const REGION_HOT_SWAP_TIMEOUT_MS = 10000;
+
+/** Pushes DAVE key material into the currently active room's E2EE worker. */
+interface DaveKeyMaterialSink {
+	setRatchet(identity: string, ratchet: DaveKeyRatchet | null): void;
+	setPassthrough(identity: string, enabled: boolean): void;
+}
+
+function createRoomKeySink(room: Room): DaveKeyMaterialSink {
+	return {
+		setRatchet: (identity, ratchet) => room.setParticipantRatchet(identity, ratchet),
+		setPassthrough: (identity, enabled) => room.setParticipantPassthrough(identity, enabled),
+	};
+}
 
 async function getRoomVideoDecoderExclusions(): Promise<RoomOptions['subscriberVideoCodecExclusions']> {
 	let timeoutId: NodeJS.Timeout | undefined;
@@ -200,10 +214,13 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	private isLocalDisconnecting = false;
 	private hotSwapOperationQueue: Array<HotSwapQueuedOperation> = [];
 	private daveClient: DaveClient | null = null;
-	// Callback installed by the join path to push ratchets into the room E2EE worker.
-	private daveRatchetSink: ((identity: string, ratchet: DaveKeyRatchet | null) => void) | null = null;
+	// Sink installed by the join path to push ratchets and passthrough windows
+	// into the E2EE worker of the currently active room.
+	private daveKeySink: DaveKeyMaterialSink | null = null;
 	// DAVE protocol version negotiated for the current connection (null = not DAVE).
 	private activeDaveVersion: number | null = null;
+	// One-shot guard: TOFU storage unavailable means key-change detection is off.
+	private tofuUnavailableLogged = false;
 
 	constructor() {
 		super();
@@ -231,27 +248,113 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		return this.connectionState.connected;
 	}
 
-	/** Register the active DAVE session client for the current connection. */
-	registerDaveClient(
-		client: VoiceEngineV2AppConnectionHostAdapter['daveClient'],
-		ratchetSink: VoiceEngineV2AppConnectionHostAdapter['daveRatchetSink'],
-	): void {
+	/** Register the active DAVE session client and its key-material sink. */
+	registerDaveClient(client: DaveClient | null, sink: DaveKeyMaterialSink | null): void {
 		this.daveClient = client;
-		this.daveRatchetSink = ratchetSink;
+		this.daveKeySink = sink;
 	}
 
-	/** Forward a gateway DAVE event to the active DaveClient and sync ratchets. */
+	/** Forward a gateway DAVE event to the active DaveClient and sync key material. */
 	routeDaveProtocolEvent(down: DaveDownMessage): void {
 		const client = this.daveClient;
 		if (client === null) {
 			return;
 		}
 		client.onEvent(down);
-		// After any event that may advance our own ratchet, push it to the worker.
-		const selfId = this.selfUserId();
-		if (selfId && this.daveRatchetSink) {
-			this.daveRatchetSink(selfId, client.getRatchet(selfId));
+		this.syncDaveKeyMaterial();
+	}
+
+	/**
+	 * Mirror the DAVE session into the worker: self ratchet always (a null
+	 * self-ratchet must fall back to silence/drop), recognized-peer ratchets
+	 * when present, and the version-0 passthrough window for every peer.
+	 */
+	private syncDaveKeyMaterial(): void {
+		const client = this.daveClient;
+		const sink = this.daveKeySink;
+		if (client === null || sink === null) {
+			return;
 		}
+		const selfId = this.selfUserId();
+		if (selfId) {
+			sink.setRatchet(selfId, client.getRatchet(selfId));
+		}
+		const passthrough = client.status === 'passthrough';
+		for (const peerId of client.getRecognizedUsers()) {
+			const ratchet = client.getRatchet(peerId);
+			if (ratchet !== null) {
+				sink.setRatchet(peerId, ratchet);
+			}
+			sink.setPassthrough(peerId, passthrough);
+		}
+	}
+
+	private handleDavePeerJoined(peerIdentity: string): void {
+		const client = this.daveClient;
+		if (client === null || !peerIdentity) {
+			return;
+		}
+		client.recognizeUser(peerIdentity);
+		this.syncDaveKeyMaterial();
+	}
+
+	private handleDavePeerLeft(peerIdentity: string): void {
+		const client = this.daveClient;
+		if (client === null || !peerIdentity) {
+			return;
+		}
+		client.forgetUser(peerIdentity);
+		// An explicit null ratchet release also tears the peer's receive cryptor
+		// down in the worker (distinct from "not established yet", which is
+		// simply not pushed).
+		this.daveKeySink?.setRatchet(peerIdentity, null);
+		this.syncDaveKeyMaterial();
+	}
+
+	/**
+	 * Bind the DAVE client to a LiveKit room: point the key sink at it, seed
+	 * the roster with participants already present, then track joins/leaves
+	 * and outbound track codecs. Used on first connect and on region hot-swap.
+	 */
+	private bindDaveSession(room: Room, client: DaveClient): void {
+		this.registerDaveClient(client, createRoomKeySink(room));
+		for (const peer of room.remoteParticipants.values()) {
+			client.recognizeUser(peer.identity);
+		}
+		room.on(RoomEvent.ParticipantConnected, (peer) => this.handleDavePeerJoined(peer.identity));
+		room.on(RoomEvent.ParticipantDisconnected, (peer) => this.handleDavePeerLeft(peer.identity));
+		this.bindDaveTrackCodecs(room);
+		this.syncDaveKeyMaterial();
+	}
+
+	/**
+	 * Map each local track's synthetic SSRC (deterministically derived from
+	 * identity + trackSid, as both peers compute it) to its DAVE codec, so
+	 * libdave's Encryptor knows the codec per SSRC instead of Unknown.
+	 */
+	private bindDaveTrackCodecs(room: Room): void {
+		const selfId = this.selfUserId();
+		if (!selfId) {
+			return;
+		}
+		const assign = (pub: TrackPublication): void => {
+			const msid = pub.track?.mediaStreamID;
+			if (!msid || !pub.trackSid) {
+				return;
+			}
+			let kind: 'audio' | 'video';
+			if (pub.kind === Track.Kind.Audio) {
+				kind = 'audio';
+			} else if (pub.kind === Track.Kind.Video) {
+				kind = 'video';
+			} else {
+				return;
+			}
+			const codecName = pub.trackInfo?.codecs?.[0]?.mimeType?.split('/')[1];
+			room.assignTrackCodec(selfId, msid, syntheticSsrc(selfId, pub.trackSid), codecForTrack(kind, codecName));
+		};
+		room.localParticipant.trackPublications.forEach(assign);
+		room.localParticipant.on(ParticipantEvent.LocalTrackPublished, assign);
 	}
 
 	private selfUserId(): string | null {
@@ -261,6 +364,24 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	/** True when the current connection negotiated DAVE (version >= 1). */
 	private isDaveEnabled(): boolean {
 		return this.activeDaveVersion !== null && this.activeDaveVersion >= 1;
+	}
+
+	/**
+	 * DAVE-derived inputs for computeChannelE2EEStatus. Empty when there is no
+	 * active DAVE session, so non-DAVE rooms keep their legacy capability-only
+	 * computation.
+	 */
+	getDaveStatusInputs(): {localDaveEstablished?: boolean; tofuOk?: boolean} {
+		const client = this.daveClient;
+		if (client === null || !this.isDaveEnabled()) {
+			return {};
+		}
+		const tofu = client.getTofuStatus();
+		if (tofu === 'unavailable' && !this.tofuUnavailableLogged) {
+			this.tofuUnavailableLogged = true;
+			logger.warn('DAVE TOFU store unavailable: key-change detection is inactive for this session');
+		}
+		return {localDaveEstablished: client.status === 'established', tofuOk: tofu !== 'broken'};
 	}
 
 	get connecting(): boolean {
@@ -1232,9 +1353,8 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 				},
 			};
 			const client = new DaveClient({mod, selfUserId: selfId, channelId, transport});
-			this.registerDaveClient(client, (identity: string, ratchet: DaveKeyRatchet | null) => {
-				room.setParticipantRatchet(identity, ratchet);
-			});
+			this.tofuUnavailableLogged = false;
+			this.bindDaveSession(room, client);
 			logger.info('DAVE client bound to room', {selfId, channelId});
 		} catch (error) {
 			logger.error('Failed to initialize DAVE client', error);
@@ -1252,23 +1372,17 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			logger.warn('DAVE migration skipped: no active client');
 			return;
 		}
-		this.registerDaveClient(client, (identity: string, ratchet: DaveKeyRatchet | null) => {
-			newRoom.setParticipantRatchet(identity, ratchet);
-		});
 		try {
 			await newRoom.setE2EEEnabled(true);
 		} catch (error) {
 			logger.error('DAVE migration: failed to enable E2EE on new room', error);
 			return;
 		}
-		const selfId = this.selfUserId();
-		if (selfId) {
-			newRoom.setParticipantRatchet(selfId, client.getRatchet(selfId));
-		}
-		for (const peerId of client.getRecognizedUsers()) {
-			newRoom.setParticipantRatchet(peerId, client.getRatchet(peerId));
-		}
-		logger.info('DAVE ratchets migrated to new room', {selfId, peers: client.getRecognizedUsers().length});
+		this.bindDaveSession(newRoom, client);
+		logger.info('DAVE session migrated to new room', {
+			selfId: this.selfUserId(),
+			peers: client.getRecognizedUsers().length,
+		});
 	}
 
 	private teardownDave(): void {
@@ -1281,7 +1395,8 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			}
 		}
 		this.daveClient = null;
-		this.daveRatchetSink = null;
+		this.daveKeySink = null;
+		this.tofuUnavailableLogged = false;
 	}
 
 	private disconnectPreviousRoom(previousRoom: Room | null, stopTracks = true): void {

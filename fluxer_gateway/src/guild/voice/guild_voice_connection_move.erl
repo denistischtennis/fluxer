@@ -5,6 +5,8 @@
 -typing([eqwalizer]).
 
 -include_lib("fluxer_gateway/include/voice_state.hrl").
+-include_lib("kernel/include/logger.hrl").
+
 
 -export([handle_client_channel_move/6]).
 
@@ -120,7 +122,7 @@ build_move_result(Build) ->
         NewConnectionId, PendingMetadata, State1Cleaned
     ),
     DaveEnabled = guild_voice_e2ee:context_e2ee_capable_guild(Context, State2),
-    {DaveVersion, State3} =
+    Negotiation =
         case DaveEnabled of
             true ->
                 guild_voice_dave:negotiate_join(
@@ -130,18 +132,51 @@ build_move_result(Build) ->
                     State2
                 );
             false ->
-                {null, State2}
+                {ok, null, State2}
         end,
-    MoveReply = #{
-        success => true,
-        needs_token => true,
-        token => Token,
-        endpoint => Endpoint,
-        connection_id => NewConnectionId,
-        dave_version => DaveVersion,
-        voice_state => voice_state_utils:external_voice_state(VoiceState)
-    },
-    {reply, MoveReply, State3}.
+    case Negotiation of
+        {ok, DaveVersion, State3} ->
+            MoveReply = #{
+                success => true,
+                needs_token => true,
+                token => Token,
+                endpoint => Endpoint,
+                connection_id => NewConnectionId,
+                dave_version => DaveVersion,
+                voice_state => voice_state_utils:external_voice_state(VoiceState)
+            },
+            {reply, MoveReply, State3};
+        {error, Reason, State3} ->
+            %% Same fail-closed rule as fresh joins: never hand out a move into an
+            %% E2EE-active channel without a negotiated DAVE room.
+            ChInt = to_channel_int(ChannelIdValue),
+            VoiceStates = maps:get(voice_states, State3, #{}),
+            case guild_voice_e2ee:channel_is_e2ee_active(ChInt, VoiceStates) of
+                true ->
+                    ?LOG_WARNING("dave move negotiation failed in e2ee-active channel; refusing move", #{
+                        channel_id => ChInt, reason => Reason
+                    }),
+                    {reply, gateway_errors:error(voice_e2ee_required), State3};
+                false ->
+                    ?LOG_WARNING("dave move negotiation failed; moving without dave", #{
+                        channel_id => ChInt, reason => Reason
+                    }),
+                    MoveReply = #{
+                        success => true,
+                        needs_token => true,
+                        token => Token,
+                        endpoint => Endpoint,
+                        connection_id => NewConnectionId,
+                        dave_version => null,
+                        voice_state => voice_state_utils:external_voice_state(VoiceState)
+                    },
+                    {reply, MoveReply, State3}
+            end
+    end.
+
+-spec to_channel_int(integer() | binary()) -> integer().
+to_channel_int(V) when is_integer(V) -> V;
+to_channel_int(V) when is_binary(V) -> binary_to_integer(V).
 
 -spec cleanup_stale_virtual_access(map(), guild_state()) -> guild_state().
 cleanup_stale_virtual_access(Build, State) ->

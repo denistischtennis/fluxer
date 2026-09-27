@@ -35,8 +35,8 @@ function mediaTypeOf(frame: EncodedFrame): number {
 
 /**
  * Build an encode transform: each outbound frame's payload is replaced by its
- * DAVE ciphertext (or a fallback produced by the cryptor when no ratchet is
- * available yet).
+ * DAVE ciphertext (or a non-empty fallback such as the Opus silence packet the
+ * cryptor emits for audio without a ratchet). Empty cryptor output is dropped.
  */
 export function createDaveEncodeTransform(cryptor: SendCryptorLike): TransformStream<EncodedFrame, EncodedFrame> {
 	return new TransformStream<EncodedFrame, EncodedFrame>({
@@ -46,6 +46,11 @@ export function createDaveEncodeTransform(cryptor: SendCryptorLike): TransformSt
 				return;
 			}
 			const result = cryptor.encrypt(mediaTypeOf(encodedFrame), new Uint8Array(encodedFrame.data));
+			if (!result.encrypted && result.bytes.byteLength === 0) {
+				// Fail closed: the cryptor could not produce ciphertext (e.g. video
+				// without a ratchet). Never forward the original frame.
+				return;
+			}
 			// Replace the frame payload with the cryptor output, preserving metadata.
 			encodedFrame.data = toArrayBuffer(result.bytes);
 			controller.enqueue(encodedFrame);

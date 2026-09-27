@@ -34,6 +34,7 @@ import {
 	getFormattedClientInfoSync,
 	installFluxerConfigDebugApi,
 	preloadClientInfo,
+	preloadDaveCapability,
 } from '@app/features/platform/utils/ClientInfo';
 import {loadLazyModule} from '@app/features/platform/utils/LazyModuleLoader';
 import {scheduleNonLatinScriptFaces} from '@app/features/theme/fonts/ScriptFontLoader';
@@ -178,6 +179,8 @@ async function bootstrapApp(): Promise<void> {
 		loadLazyModule(() => import('@app/features/user/state/StatusPage')),
 	]);
 	void preloadClientInfo();
+	// Start the libdave WASM capability read off the gateway identify hot path.
+	void preloadDaveCapability();
 	QuickSwitcher.setI18n(reactiveI18n);
 	ChannelDisplayName.setI18n(reactiveI18n);
 	Keybind.setI18n(reactiveI18n);

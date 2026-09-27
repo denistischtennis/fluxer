@@ -710,10 +710,10 @@ export class RpcService {
 						new_epoch: result.newEpoch,
 						committer_user_id:
 							result.committerUserId !== undefined && result.committerUserId.length > 0
-								? BigInt(result.committerUserId)
+								? result.committerUserId
 								: undefined,
 						roster: result.roster?.map((entry) => ({
-							user_id: BigInt(entry.userId),
+							user_id: entry.userId,
 							leaf_index: entry.leafIndex,
 						})),
 						commit_b64: result.commitB64,

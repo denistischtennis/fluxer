@@ -879,7 +879,11 @@ class MediaEngineFacade extends Store {
 			const channelId = voiceEngineV2AppConnectionHostAdapter.channelId;
 			const status =
 				voiceEngineV2AppConnectionHostAdapter.connected && channelId
-					? computeChannelE2EEStatus(voiceEngineV2AppConnectionHostAdapter.guildId, channelId)
+					? computeChannelE2EEStatus(
+							voiceEngineV2AppConnectionHostAdapter.guildId,
+							channelId,
+							voiceEngineV2AppConnectionHostAdapter.getDaveStatusInputs(),
+						)
 					: null;
 			if (room === previousRoom && status === previousStatus) {
 				return;
@@ -1511,6 +1515,11 @@ class MediaEngineFacade extends Store {
 			return;
 		}
 		voiceEngineV2AppConnectionHostAdapter.routeDaveProtocolEvent(data);
+	}
+
+	/** DAVE session inputs (established flag, TOFU health) for E2EE status math. */
+	getDaveStatusInputs(): {localDaveEstablished?: boolean; tofuOk?: boolean} {
+		return voiceEngineV2AppConnectionHostAdapter.getDaveStatusInputs();
 	}
 
 	private handleVoiceServerUpdateViaJs(raw: VoiceServerUpdateData): void {

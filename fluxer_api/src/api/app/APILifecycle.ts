@@ -34,6 +34,7 @@ import {ensureApnsSigningKey} from '@app/api/push/ApnsPushService';
 import {initializeSearch, shutdownSearch} from '@app/api/SearchFactory';
 import {warmupAdminSearchIndexes} from '@app/api/search/SearchWarmup';
 import {VisionarySlotInitializer} from '@app/api/stripe/VisionarySlotInitializer';
+import {shutdownDaveSignerService} from '@app/api/voice/dave/DaveSignerService';
 import {VoiceDataInitializer} from '@app/api/voice/VoiceDataInitializer';
 import {JetStreamWorkerQueue} from '@app/api/worker/JetStreamWorkerQueue';
 import {WorkerService} from '@app/api/worker/WorkerService';
@@ -252,6 +253,12 @@ export function createShutdown(config: APIConfig, logger: ILogger): () => Promis
 			logger.info('Voice resources shut down');
 		} catch (error) {
 			logger.error({error}, 'Error shutting down voice resources');
+		}
+		try {
+			shutdownDaveSignerService();
+			logger.info('DAVE signer service shut down');
+		} catch (error) {
+			logger.error({error}, 'Error shutting down DAVE signer service');
 		}
 		if (jsConnectionManager) {
 			try {

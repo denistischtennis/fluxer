@@ -72,6 +72,29 @@ describe('DAVE encode transform', () => {
 		const [frame] = await runThrough<RTCEncodedAudioFrame>(t, audioFrame(new ArrayBuffer(0)));
 		expect(new Uint8Array(frame!.data).length).toBe(0);
 	});
+
+	test('drops frames when the cryptor returns empty unencrypted output', async () => {
+		// Mirrors DaveSendCryptor: video with no ratchet yields {bytes: <empty>, encrypted: false}.
+		const t = createDaveEncodeTransform({encrypt: () => ({bytes: new Uint8Array(), encrypted: false})} as never);
+		const out = await runThrough<RTCEncodedAudioFrame>(
+			t,
+			audioFrame(new Uint8Array([1, 2, 3]).buffer.slice(0)),
+		);
+		expect(out.length).toBe(0);
+	});
+
+	test('enqueues non-empty unencrypted fallback (Opus silence packet)', async () => {
+		// Audio with no ratchet yields the silence packet with encrypted:false; it must still flow.
+		const t = createDaveEncodeTransform({
+			encrypt: () => ({bytes: new Uint8Array([0xf8, 0xff, 0xfe]), encrypted: false}),
+		} as never);
+		const [frame] = await runThrough<RTCEncodedAudioFrame>(
+			t,
+			audioFrame(new Uint8Array([1, 2, 3]).buffer.slice(0)),
+		);
+		expect(frame).toBeDefined();
+		expect(Array.from(new Uint8Array(frame!.data))).toEqual([0xf8, 0xff, 0xfe]);
+	});
 });
 
 describe('DAVE decode transform', () => {

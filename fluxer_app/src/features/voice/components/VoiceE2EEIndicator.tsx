@@ -26,7 +26,10 @@ export const VoiceE2EEIndicator = observer(function VoiceE2EEIndicator({
 	const {i18n} = useLingui();
 	useMediaEngineVersion();
 	void MediaEngine.getAllVoiceStates();
-	const gatewayStatus = computeChannelE2EEStatus(guildId, channelId, {emptyChannelStatus: 'encrypted'});
+	const gatewayStatus = computeChannelE2EEStatus(guildId, channelId, {
+		emptyChannelStatus: 'encrypted',
+		...MediaEngine.getDaveStatusInputs(),
+	});
 	const status = gatewayStatus;
 	if (status === 'none') return null;
 	const isEncrypted = status === 'encrypted';

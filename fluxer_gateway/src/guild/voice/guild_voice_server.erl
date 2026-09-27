@@ -210,7 +210,7 @@ handle_call_local({set_voice_states, VoiceStates}, State) when is_map(VoiceState
 handle_call_local({dave_join, ChIdBin, UserId, MaxVer}, State) ->
     RoomState = dave_room(ChIdBin, State),
     Members = dave_members_from(RoomState),
-    {Version, NewRoom} = guild_voice_dave:drive_join(UserId, MaxVer, RoomState, Members),
+    {Version, NewRoom} = guild_voice_dave:drive_join(UserId, MaxVer, ChIdBin, RoomState, Members),
     {reply, {ok, Version}, put_dave_room(ChIdBin, NewRoom, State)};
 handle_call_local({dave_message, ChIdBin, Sender, Raw}, State) ->
     RoomState = dave_room(ChIdBin, State),
@@ -230,7 +230,7 @@ handle_call_local(_, State) ->
 dave_room(ChIdBin, State) ->
     Rooms = maps:get(dave_rooms, State, #{}),
     case maps:get(ChIdBin, Rooms, undefined) of
-        undefined -> voice_dave_coordinator:new_room_state(false);
+        undefined -> voice_dave_coordinator:new_room_state(false, ChIdBin);
         RS -> RS
     end.
 
@@ -711,7 +711,7 @@ guild_state_reply_loop(TestFun) ->
     end.
 
 apply_guild_state_preserves_dave_rooms_test() ->
-    Room1 = voice_dave_coordinator:new_room_state(false),
+    Room1 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     Room2 = Room1#{epoch => 7},
     State = #{
         guild_id => 1,

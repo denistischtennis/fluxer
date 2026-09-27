@@ -23,7 +23,6 @@ export const E2EE_TRACK_ID = 'lk_e2ee_track_id';
 export const SALT = 'LKFrameEncryptionKey';
 
 export const KEY_PROVIDER_DEFAULTS: KeyProviderOptions = {
-	sharedKey: false,
 	ratchetSalt: SALT,
 	ratchetWindowSize: 8,
 	failureTolerance: DECRYPTION_FAILURE_TOLERANCE,

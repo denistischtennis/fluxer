@@ -10,7 +10,7 @@ import type {
 	Session as WasmSession,
 	TransientKeys as WasmTransientKeys,
 } from '@fluxer/libdave/wasm';
-import {TofuStore} from './tofuStore.js';
+import {TofuStore, type TofuStatus} from './tofuStore.js';
 import {ratchetFromWasm, encodeRatchet, type DaveKeyRatchet} from './ratchetWire.js';
 
 const MLS_NEW_GROUP_EXPECTED_EPOCH = '1';
@@ -41,7 +41,9 @@ export interface DaveDownMessage {
 		| 'welcome';
 	version?: number;
 	transition_id?: number;
-	epoch?: string;
+	/** The gateway encodes this as a JSON number; upstream libdave samples use a
+	 *  string. Normalized with String() on ingress. */
+	epoch?: string | number;
 	data?: string;
 	target_user_id?: string;
 }
@@ -69,7 +71,10 @@ export class DaveClient {
 	private readonly daveProtocolTransitions = new Map<number, number>();
 	private latestPreparedTransitionVersion = 0;
 	private protocolVersion = 0;
-	private tofuStatus: 'unknown' | 'pinned' | 'broken' = 'unknown';
+	private tofuStatus: TofuStatus = 'unknown';
+	private established = false;
+	private disabledByTofu = false;
+	private mlsFailed = false;
 	private destroyed = false;
 
 	constructor(params: CreateDaveClientParams) {
@@ -81,11 +86,10 @@ export class DaveClient {
 		this.instanceKey = params.instanceKey ?? params.channelId;
 		this.transientKeys = new this.mod.TransientKeys();
 		this.session = new this.mod.Session('', '', (source: string, reason: string) => {
-			// MLS failure callback: surface as a broken status; the coordinator
-			// will drive a re-init via prepare_epoch.
-			void source;
-			void reason;
-			this.tofuStatus = this.tofuStatus === 'broken' ? 'broken' : this.tofuStatus;
+			// MLS failure callback: log the diagnostics and mark the session
+			// failed; the coordinator drives recovery via prepare_epoch.
+			console.error(`[dave] MLS failure: ${source}: ${reason}`, {channelId: this.channelId});
+			this.mlsFailed = true;
 		});
 	}
 
@@ -93,17 +97,17 @@ export class DaveClient {
 		if (this.destroyed) {
 			return 'idle';
 		}
-		if (this.tofuStatus === 'broken') {
+		if (this.tofuStatus === 'broken' || this.disabledByTofu || this.mlsFailed) {
 			return 'broken';
 		}
 		if (this.protocolVersion === 0) {
 			return this.latestPreparedTransitionVersion === 0 ? 'idle' : 'passthrough';
 		}
-		return 'handshaking';
+		return this.established ? 'established' : 'handshaking';
 	}
 
 	public markEstablished(): void {
-		// Called by the host once the group is live (post execute_transition).
+		this.established = true;
 	}
 
 	/** Roster membership changes driven by voice-state updates. */
@@ -123,6 +127,9 @@ export class DaveClient {
 
 	/** Get the encoded ratchet for a peer (or self) for piping into the e2ee worker. */
 	public getRatchet(userId: string): DaveKeyRatchet | null {
+		if (this.disabledByTofu || this.mlsFailed) {
+			return null;
+		}
 		if (this.latestPreparedTransitionVersion === this.disabledVersion()) {
 			return null;
 		}
@@ -134,7 +141,7 @@ export class DaveClient {
 		return Uint8Array.from(raw as number[]);
 	}
 
-	public getTofuStatus(): 'unknown' | 'pinned' | 'broken' {
+	public getTofuStatus(): TofuStatus {
 		return this.tofuStatus;
 	}
 
@@ -151,12 +158,14 @@ export class DaveClient {
 			case 'execute_transition':
 				this.handleExecuteTransition(down.transition_id ?? 0);
 				break;
-			case 'prepare_epoch':
-				this.handlePrepareEpoch(down.epoch ?? MLS_NEW_GROUP_EXPECTED_EPOCH, down.version ?? 0);
-				if (down.epoch === MLS_NEW_GROUP_EXPECTED_EPOCH) {
+			case 'prepare_epoch': {
+				const epoch = down.epoch === undefined ? MLS_NEW_GROUP_EXPECTED_EPOCH : String(down.epoch);
+				this.handlePrepareEpoch(epoch, down.version ?? 0);
+				if (epoch === MLS_NEW_GROUP_EXPECTED_EPOCH) {
 					this.sendKeyPackage();
 				}
 				break;
+			}
 			case 'external_sender_package':
 				this.handleExternalSenderPackage(down.data ?? '');
 				break;
@@ -193,9 +202,23 @@ export class DaveClient {
 		const bytes = decodeBytes(dataB64);
 		const status = this.tofu.verify(this.instanceKey, dataB64);
 		this.tofuStatus = status;
-		if (status !== 'broken') {
-			this.session.SetExternalSender(bytes);
+		if (status === 'broken') {
+			// The pinned delivery-service identity changed. Fail closed: never
+			// install the new sender, and stop handing out ratchets so no media
+			// flows under a suspect trust anchor.
+			console.error('[dave] TOFU mismatch: external sender package changed; session disabled', {
+				channelId: this.channelId,
+			});
+			this.disabledByTofu = true;
+			return;
 		}
+		if (status === 'unavailable') {
+			console.warn(
+				'[dave] TOFU storage unavailable; key-change detection is not active for this session',
+				{channelId: this.channelId},
+			);
+		}
+		this.session.SetExternalSender(bytes);
 	}
 
 	private handleProposals(proposalsB64: string): void {
@@ -214,6 +237,7 @@ export class DaveClient {
 			return;
 		}
 		if (joinedGroup) {
+			this.established = true;
 			this.prepareDaveProtocolRatchets(transitionId, this.session.GetProtocolVersion());
 			this.maybeSendReadyForTransition(transitionId);
 		} else {
@@ -227,6 +251,7 @@ export class DaveClient {
 		const roster = this.session.ProcessWelcome(welcome, this.getRecognizedUserIDs());
 		const joinedGroup = roster != null;
 		if (joinedGroup) {
+			this.established = true;
 			this.prepareDaveProtocolRatchets(transitionId, this.session.GetProtocolVersion());
 			this.maybeSendReadyForTransition(transitionId);
 		} else {

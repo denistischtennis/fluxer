@@ -426,9 +426,57 @@ public:
                 }
             }
 
-            // --- match commit proposal references against pending -------
-            auto appliedAdds = std::vector<std::string>();
-            auto appliedRemoves = std::vector<uint32_t>();
+            // --- shadow occupancy ---------------------------------------
+            auto occupancy = std::map<uint32_t, std::string>();
+            auto rosterArr = emscripten::vecFromJSArray<val>(knownRoster);
+            for (const auto& entry : rosterArr) {
+                auto leafIndex = entry["leafIndex"].as<uint32_t>();
+                occupancy[leafIndex] = entry["userId"].as<std::string>();
+            }
+
+            // --- committer identity -------------------------------------
+            auto committerLeaf =
+              ::mlspp::tls::var::get<::mlspp::MemberSender>(groupContent.sender.sender);
+
+            // The committer occupies their sender leaf. The gateway asserts the
+            // committer's user identity from the authenticated WS sender (founding
+            // commits carry no update_path, so it cannot be derived from the commit
+            // alone). If a path is present, bind it to the claimed leaf and verify
+            // its self-signature so a relayed blob cannot misattribute a path that
+            // belongs to some other leaf.
+            if (committerUserId.empty()) {
+                return Fail("missing committer user id");
+            }
+            if (commit.path.has_value()) {
+                // Update/commit-source leaves sign over a MemberBinding; verifying
+                // with the live group id and sender leaf ties the path to this
+                // exact group position instead of merely to a keypair.
+                ::mlspp::LeafNode::MemberBinding binding{gid, committerLeaf.sender};
+                if (!commit.path->leaf_node.verify(suite_, binding)) {
+                    return Fail("commit path leaf node signature invalid");
+                }
+                auto pathUserId = UserIdFromCredential(commit.path->leaf_node.credential);
+                if (pathUserId != committerUserId) {
+                    return Fail("commit path identity does not match claimed committer");
+                }
+            }
+            // The committer must already occupy the leaf they send from, unless
+            // this is the founding commit (empty prior roster). Without this, a
+            // relayed blob could reassign any leaf to any claimed identity.
+            auto priorIt = occupancy.find(committerLeaf.sender.val);
+            if (priorIt != occupancy.end() && priorIt->second != committerUserId) {
+                return Fail("commit sender leaf is occupied by a different member");
+            }
+            occupancy[committerLeaf.sender.val] = committerUserId;
+
+            // --- match and apply commit proposal references, in order ----
+            // Clients process the commit's proposals in the order the committer
+            // listed them; each Add takes the lowest free leaf at the moment it
+            // is applied. Mirroring that here keeps the shadow roster identical
+            // to the real tree — a committer reordering references (which would
+            // shift every later leaf assignment) is rejected instead of being
+            // silently mis-tracked, which could route future removals to the
+            // wrong member.
             auto matchedRefs = std::set<std::string>();
             for (const auto& por : commit.proposals) {
                 if (::mlspp::tls::variant<::mlspp::ProposalOrRefType>::type(por.content)
@@ -445,52 +493,18 @@ public:
                     return Fail("commit references the same proposal twice");
                 }
                 if (it->second.isAdd) {
-                    appliedAdds.push_back(it->second.userId);
+                    uint32_t candidate = 0;
+                    while (occupancy.count(candidate) != 0) {
+                        candidate++;
+                    }
+                    occupancy[candidate] = it->second.userId;
                 }
                 else {
-                    appliedRemoves.push_back(it->second.leafIndex);
+                    occupancy.erase(it->second.leafIndex);
                 }
             }
             if (matchedRefs.size() != pendingByRef.size()) {
                 return Fail("commit does not cover all pending proposals");
-            }
-
-            // --- committer identity -------------------------------------
-            auto committerLeaf =
-              ::mlspp::tls::var::get<::mlspp::MemberSender>(groupContent.sender.sender);
-
-            // --- apply to shadow roster ---------------------------------
-            auto occupancy = std::map<uint32_t, std::string>();
-            auto rosterArr = emscripten::vecFromJSArray<val>(knownRoster);
-            for (const auto& entry : rosterArr) {
-                auto leafIndex = entry["leafIndex"].as<uint32_t>();
-                occupancy[leafIndex] = entry["userId"].as<std::string>();
-            }
-
-            // The committer occupies their sender leaf. The gateway asserts the
-            // committer's user identity from the authenticated WS sender (founding
-            // commits carry no update_path, so it cannot be derived from the commit
-            // alone). If a path is present, cross-check it against the claim.
-            if (committerUserId.empty()) {
-                return Fail("missing committer user id");
-            }
-            if (commit.path.has_value()) {
-                auto pathUserId = UserIdFromCredential(commit.path->leaf_node.credential);
-                if (pathUserId != committerUserId) {
-                    return Fail("commit path identity does not match claimed committer");
-                }
-            }
-            occupancy[committerLeaf.sender.val] = committerUserId;
-
-            for (const auto& userId : appliedAdds) {
-                uint32_t candidate = 0;
-                while (occupancy.count(candidate) != 0) {
-                    candidate++;
-                }
-                occupancy[candidate] = userId;
-            }
-            for (auto leafIndex : appliedRemoves) {
-                occupancy.erase(leafIndex);
             }
 
             // --- assemble result ----------------------------------------

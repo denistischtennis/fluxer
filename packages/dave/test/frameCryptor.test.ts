@@ -75,12 +75,12 @@ describe('DaveFrameCryptor audio roundtrip', () => {
 		send.dispose();
 	});
 
-	test('no ratchet on send -> video passthrough unchanged', () => {
+	test('no ratchet on send -> video is dropped (fail-closed, never plaintext)', () => {
 		const send = new DaveSendCryptor(mod);
 		const v = Uint8Array.from([0x10, 0x20, 0x30]);
 		const enc = send.encrypt(MEDIA_TYPE_VIDEO, v);
 		expect(enc.encrypted).toBe(false);
-		expect(Array.from(enc.bytes)).toEqual(Array.from(v));
+		expect(enc.bytes.byteLength).toBe(0);
 		send.dispose();
 	});
 });

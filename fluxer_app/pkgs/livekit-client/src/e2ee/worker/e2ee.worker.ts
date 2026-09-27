@@ -28,19 +28,31 @@ import {ParticipantKeyHandler} from './ParticipantKeyHandler.ts';
 
 const participantCryptors: Array<FrameCryptor> = [];
 const participantKeys: Map<string, ParticipantKeyHandler> = new Map();
-let sharedKeyHandler: ParticipantKeyHandler | undefined;
 const messageQueue = new AsyncQueue();
 
 const isEncryptionEnabled: boolean = false;
 
 // --- DAVE-mode crypto state -------------------------------------------------
-// Populated lazily when the room is initialised with `mode: 'dave'`. Send-side
-// cryptors are keyed by participant identity (our own outbound sender);
-// receive-side by remote participant identity (the ratchet is per-sender).
-import type {DaveReceiveCryptor, DaveSendCryptor} from '@fluxer/dave';
+import type {DaveCodec, DaveKeyRatchet, DaveReceiveCryptor, DaveSendCryptor} from '@fluxer/dave';
 
+// Send cryptors are keyed `<identity>:<trackId>` so every outbound track keeps
+// its own synthetic-SSRC/codec binding; receive cryptors are keyed by remote
+// participant identity (the ratchet is per-sender). Ratchets, passthrough
+// windows and codec assignments are remembered per key so cryptors created
+// later (transform set up before the protocol material arrived, or vice versa)
+// pick everything up at construction.
 const daveSendCryptors: Map<string, DaveSendCryptor> = new Map();
 const daveReceiveCryptors: Map<string, DaveReceiveCryptor> = new Map();
+const daveKnownRatchets: Map<string, DaveKeyRatchet> = new Map();
+const davePassthroughState: Map<string, boolean> = new Map();
+const davePendingCodecs: Map<string, {ssrc: number; codec: number}> = new Map();
+// Remote receive cryptors stay alive while at least one of the sender's tracks
+// still has a registered decode transform.
+const daveRecvTrackIds: Map<string, Set<string>> = new Map();
+// Cryptors with a live frame pipeline; disposal is deferred until the pipe ends
+// so in-flight frames never touch freed WASM objects.
+const davePipedCryptors = new WeakSet<DaveSendCryptor | DaveReceiveCryptor>();
+const davePendingDisposal = new Set<DaveSendCryptor | DaveReceiveCryptor>();
 let daveMode = false;
 
 async function ensureDaveModule() {
@@ -48,13 +60,26 @@ async function ensureDaveModule() {
 	return DaveModuleFactory();
 }
 
-async function getDaveSendCryptor(identity: string): Promise<DaveSendCryptor> {
-	let c = daveSendCryptors.get(identity);
+function daveSendKey(identity: string, trackId: string): string {
+	return `${identity}:${trackId}`;
+}
+
+async function getDaveSendCryptor(identity: string, trackId: string): Promise<DaveSendCryptor> {
+	const key = daveSendKey(identity, trackId);
+	let c = daveSendCryptors.get(key);
 	if (!c) {
 		const {DaveSendCryptor: SendCtor} = await import('@fluxer/dave');
 		const mod = await ensureDaveModule();
 		c = new SendCtor(mod);
-		daveSendCryptors.set(identity, c);
+		const ratchet = daveKnownRatchets.get(identity);
+		if (ratchet) {
+			c.setRatchet(ratchet);
+		}
+		const pending = davePendingCodecs.get(key);
+		if (pending) {
+			c.assignSsrc(pending.ssrc, pending.codec as DaveCodec);
+		}
+		daveSendCryptors.set(key, c);
 	}
 	return c;
 }
@@ -65,12 +90,60 @@ async function getDaveReceiveCryptor(identity: string): Promise<DaveReceiveCrypt
 		const {DaveReceiveCryptor: RecvCtor} = await import('@fluxer/dave');
 		const mod = await ensureDaveModule();
 		c = new RecvCtor(mod);
+		const ratchet = daveKnownRatchets.get(identity);
+		if (ratchet) {
+			c.transitionTo(ratchet);
+		}
+		if (davePassthroughState.get(identity)) {
+			c.setPassthrough(true);
+		}
 		daveReceiveCryptors.set(identity, c);
 	}
 	return c;
 }
 
-let useSharedKey: boolean = false;
+function registerDaveRecvTrack(identity: string, trackId: string): void {
+	let tracks = daveRecvTrackIds.get(identity);
+	if (!tracks) {
+		tracks = new Set();
+		daveRecvTrackIds.set(identity, tracks);
+	}
+	tracks.add(trackId);
+}
+
+function releaseDaveCryptor(cryptor: DaveSendCryptor | DaveReceiveCryptor): void {
+	if (davePipedCryptors.has(cryptor)) {
+		davePendingDisposal.add(cryptor);
+	} else {
+		cryptor.dispose();
+	}
+}
+
+function finishDavePipe(cryptor: DaveSendCryptor | DaveReceiveCryptor): void {
+	davePipedCryptors.delete(cryptor);
+	if (davePendingDisposal.delete(cryptor)) {
+		cryptor.dispose();
+	}
+}
+
+function pipeDaveSend(cryptor: DaveSendCryptor, readable: ReadableStream, writable: WritableStream): void {
+	davePipedCryptors.add(cryptor);
+	readable
+		.pipeThrough(createDaveEncodeTransform(cryptor))
+		.pipeTo(writable)
+		.catch((e) => workerLogger.warn('dave encode transform error', {error: e}))
+		.finally(() => finishDavePipe(cryptor));
+}
+
+function pipeDaveRecv(cryptor: DaveReceiveCryptor, readable: ReadableStream, writable: WritableStream): void {
+	davePipedCryptors.add(cryptor);
+	readable
+		.pipeThrough(createDaveDecodeTransform(cryptor))
+		.pipeTo(writable)
+		.catch((e) => workerLogger.warn('dave decode transform error', {error: e}))
+		.finally(() => finishDavePipe(cryptor));
+}
+
 
 let sifTrailer: NonSharedUint8Array | undefined;
 
@@ -98,7 +171,6 @@ self.addEventListener('message', (ev) => {
 				workerLogger.setLevel(data.loglevel);
 				workerLogger.info('e2ee worker initialized');
 				keyProviderOptions = data.keyProviderOptions;
-				useSharedKey = !!data.keyProviderOptions.sharedKey;
 				daveMode = (data as {mode?: string}).mode === 'dave';
 				if (daveMode) {
 					await ensureDaveModule();
@@ -121,10 +193,8 @@ self.addEventListener('message', (ev) => {
 			case 'decode': {
 				if (daveMode) {
 					const recv = await getDaveReceiveCryptor(data.participantIdentity);
-					data.readableStream
-						.pipeThrough(createDaveDecodeTransform(recv))
-						.pipeTo(data.writableStream)
-						.catch((e) => workerLogger.warn('dave decode transform error', {error: e}));
+					registerDaveRecvTrack(data.participantIdentity, data.trackId);
+					pipeDaveRecv(recv, data.readableStream, data.writableStream);
 					break;
 				}
 				const cryptor = getTrackCryptor(data.participantIdentity, data.trackId);
@@ -134,11 +204,8 @@ self.addEventListener('message', (ev) => {
 			}
 			case 'encode': {
 				if (daveMode) {
-					const send = await getDaveSendCryptor(data.participantIdentity);
-					data.readableStream
-						.pipeThrough(createDaveEncodeTransform(send))
-						.pipeTo(data.writableStream)
-						.catch((e) => workerLogger.warn('dave encode transform error', {error: e}));
+					const send = await getDaveSendCryptor(data.participantIdentity, data.trackId);
+					pipeDaveSend(send, data.readableStream, data.writableStream);
 					break;
 				}
 				const pubCryptor = getTrackCryptor(data.participantIdentity, data.trackId);
@@ -207,9 +274,7 @@ self.addEventListener('message', (ev) => {
 				break;
 
 			case 'setKey':
-				if (useSharedKey) {
-					await setSharedKey(data.key, data.keyIndex, data.updateCurrentKeyIndex);
-				} else if (data.participantIdentity) {
+				if (data.participantIdentity) {
 					workerLogger.info(`set participant sender key ${data.participantIdentity} index ${data.keyIndex}`);
 					await getParticipantKeyHandler(data.participantIdentity).setKey(
 						data.key,
@@ -217,13 +282,45 @@ self.addEventListener('message', (ev) => {
 						data.updateCurrentKeyIndex,
 					);
 				} else {
-					workerLogger.error('no participant Id was provided and shared key usage is disabled');
+					workerLogger.error('no participant Id was provided for setKey');
 				}
 				break;
 			case 'removeTransform':
-				unsetCryptorParticipant(data.trackId, data.participantIdentity);
+				if (daveMode) {
+					const sendKey = daveSendKey(data.participantIdentity, data.trackId);
+					const send = daveSendCryptors.get(sendKey);
+					if (send) {
+						daveSendCryptors.delete(sendKey);
+						davePendingCodecs.delete(sendKey);
+						releaseDaveCryptor(send);
+					}
+					const tracks = daveRecvTrackIds.get(data.participantIdentity);
+					if (tracks) {
+						tracks.delete(data.trackId);
+						if (tracks.size === 0) {
+							daveRecvTrackIds.delete(data.participantIdentity);
+							const recv = daveReceiveCryptors.get(data.participantIdentity);
+							if (recv) {
+								daveReceiveCryptors.delete(data.participantIdentity);
+								davePassthroughState.delete(data.participantIdentity);
+								releaseDaveCryptor(recv);
+							}
+						}
+					}
+				} else {
+					unsetCryptorParticipant(data.trackId, data.participantIdentity);
+				}
 				break;
 			case 'updateCodec': {
+				if (daveMode) {
+					// DAVE codec/SSRC binding flows through daveAssignCodec; never
+					// spin up a legacy FrameCryptor for a reused sender/receiver.
+					workerLogger.debug('ignoring updateCodec in dave mode', {
+						participantIdentity: data.participantIdentity,
+						trackId: data.trackId,
+					});
+					break;
+				}
 				const trackCryptor = getTrackCryptor(data.participantIdentity, data.trackId, data.previousTrackId);
 				if (data.codec) {
 					trackCryptor.setVideoCodec(data.codec);
@@ -260,22 +357,56 @@ self.addEventListener('message', (ev) => {
 				handleSifTrailer(data.trailer);
 				break;
 			case 'daveSetRatchet': {
-				const send = await getDaveSendCryptor(data.participantIdentity);
-				send.setRatchet(data.ratchet);
-				const recv = await getDaveReceiveCryptor(data.participantIdentity);
-				if (data.ratchet) {
-					recv.transitionTo(data.ratchet);
+				const {participantIdentity, isLocal, ratchet} = data;
+				if (ratchet === null) {
+					daveKnownRatchets.delete(participantIdentity);
+				} else {
+					daveKnownRatchets.set(participantIdentity, ratchet);
+				}
+				if (isLocal) {
+					// Only the local participant ever owns send cryptors; fan the
+					// fresh ratchet out to every live outbound track cryptor.
+					const prefix = `${participantIdentity}:`;
+					for (const [key, cryptor] of daveSendCryptors) {
+						if (key.startsWith(prefix)) {
+							cryptor.setRatchet(ratchet);
+						}
+					}
+				} else if (ratchet !== null) {
+					const existing = daveReceiveCryptors.get(participantIdentity);
+					if (existing) {
+						existing.transitionTo(ratchet);
+					} else {
+						// Creation applies the just-stored ratchet exactly once.
+						await getDaveReceiveCryptor(participantIdentity);
+					}
+				} else {
+					// Peer forgotten: tear down its receive-side state entirely.
+					davePassthroughState.delete(participantIdentity);
+					daveRecvTrackIds.delete(participantIdentity);
+					const recv = daveReceiveCryptors.get(participantIdentity);
+					if (recv) {
+						daveReceiveCryptors.delete(participantIdentity);
+						releaseDaveCryptor(recv);
+					}
 				}
 				break;
 			}
 			case 'davePassthrough': {
-				const recv = await getDaveReceiveCryptor(data.participantIdentity);
-				recv.setPassthrough(data.enabled);
+				davePassthroughState.set(data.participantIdentity, data.enabled);
+				const recv = daveReceiveCryptors.get(data.participantIdentity);
+				if (recv) {
+					recv.setPassthrough(data.enabled);
+				}
 				break;
 			}
 			case 'daveAssignCodec': {
-				const send = await getDaveSendCryptor(data.participantIdentity);
-				send.assignSsrc(data.ssrc, data.codec);
+				const key = daveSendKey(data.participantIdentity, data.trackId);
+				davePendingCodecs.set(key, {ssrc: data.ssrc, codec: data.codec});
+				const send = daveSendCryptors.get(key);
+				if (send) {
+					send.assignSsrc(data.ssrc, data.codec as DaveCodec);
+				}
 				break;
 			}
 			default:
@@ -285,16 +416,12 @@ self.addEventListener('message', (ev) => {
 });
 
 async function handleRatchetRequest(data: RatchetRequestMessage['data']) {
-	if (useSharedKey) {
-		const keyHandler = getSharedKeyHandler();
-		await keyHandler.ratchetKey(data.keyIndex);
-		keyHandler.resetKeyStatus();
-	} else if (data.participantIdentity) {
+	if (data.participantIdentity) {
 		const keyHandler = getParticipantKeyHandler(data.participantIdentity);
 		await keyHandler.ratchetKey(data.keyIndex);
 		keyHandler.resetKeyStatus();
 	} else {
-		workerLogger.error('no participant Id was provided for ratchet request and shared key usage is disabled');
+		workerLogger.error('no participant Id was provided for ratchet request');
 	}
 }
 
@@ -348,9 +475,6 @@ function getTrackCryptor(participantIdentity: string, trackId: string, previousT
 }
 
 function getParticipantKeyHandler(participantIdentity: string) {
-	if (useSharedKey) {
-		return getSharedKeyHandler();
-	}
 	let keys = participantKeys.get(participantIdentity);
 	if (!keys) {
 		keys = new ParticipantKeyHandler(participantIdentity, keyProviderOptions);
@@ -360,13 +484,6 @@ function getParticipantKeyHandler(participantIdentity: string) {
 	return keys;
 }
 
-function getSharedKeyHandler() {
-	if (!sharedKeyHandler) {
-		workerLogger.debug('creating new shared key handler');
-		sharedKeyHandler = new ParticipantKeyHandler('shared-key', keyProviderOptions);
-	}
-	return sharedKeyHandler;
-}
 
 function unsetCryptorParticipant(trackId: string, participantIdentity: string) {
 	const cryptors = participantCryptors.filter(
@@ -393,10 +510,6 @@ function setEncryptionEnabled(enable: boolean, participantIdentity: string) {
 	encryptionEnabledMap.set(participantIdentity, enable);
 }
 
-async function setSharedKey(key: CryptoKey, index?: number, updateCurrentKeyIndex?: boolean) {
-	workerLogger.info('set shared key', {index});
-	await getSharedKeyHandler().setKey(key, index, updateCurrentKeyIndex);
-}
 
 function setupCryptorErrorEvents(cryptor: FrameCryptor) {
 	cryptor.on(CryptorEvent.Error, (error) => {
@@ -435,6 +548,18 @@ if (self.RTCTransformEvent) {
 		const options = transformer.options as ScriptTransformOptions;
 		const {kind, participantIdentity, trackId, codec, hasPacketTrailer} = options;
 		messageQueue.run(async () => {
+			if (daveMode) {
+				workerLogger.debug('onrtctransform dave setup', {participantIdentity, trackId, kind});
+				if (kind === 'encode') {
+					const send = await getDaveSendCryptor(participantIdentity, trackId);
+					pipeDaveSend(send, transformer.readable, transformer.writable);
+				} else {
+					const recv = await getDaveReceiveCryptor(participantIdentity);
+					registerDaveRecvTrack(participantIdentity, trackId);
+					pipeDaveRecv(recv, transformer.readable, transformer.writable);
+				}
+				return;
+			}
 			const cryptor = getTrackCryptor(participantIdentity, trackId);
 			cryptor.setHasFrameMetadata(hasPacketTrailer);
 			workerLogger.debug('onrtctransform setup', {participantIdentity, trackId, codec});

@@ -10,6 +10,7 @@
 import {existsSync} from 'node:fs';
 import {Worker} from 'node:worker_threads';
 import {fileURLToPath} from 'node:url';
+import {Config} from '@app/api/Config';
 import type {DaveOp} from '@app/api/voice/dave/DaveSignerWorker';
 import {Logger} from '@app/api/Logger';
 
@@ -34,6 +35,31 @@ interface PendingCall {
 	resolve: (value: unknown) => void;
 	reject: (err: Error) => void;
 	timer: NodeJS.Timeout;
+}
+
+interface DaveWorkerResponse {
+	id: number;
+	ok: boolean;
+	value?: unknown;
+	error?: string;
+}
+
+/**
+ * Structural subset of node:worker_threads.Worker used by this service.
+ * Exported so tests can inject fake workers without spawning real threads.
+ */
+export interface DaveWorkerHandle {
+	postMessage(message: unknown): void;
+	on(event: 'error', listener: (err: Error) => void): void;
+	on(event: 'exit', listener: (code: number) => void): void;
+	on(event: 'message', listener: (msg: DaveWorkerResponse) => void): void;
+	terminate(): Promise<number>;
+}
+
+export type DaveWorkerFactory = () => DaveWorkerHandle;
+
+function defaultDaveWorkerFactory(): DaveWorkerHandle {
+	return new Worker(resolveWorkerPath());
 }
 
 function b64ToBytes(value: string): number[] {
@@ -77,13 +103,17 @@ function resolveWorkerPath(): string {
 }
 
 export class DaveSignerService {
-	private worker: Worker | null = null;
+	private worker: DaveWorkerHandle | null = null;
+	private startingWorker: DaveWorkerHandle | null = null;
 	private readonly pending = new Map<number, PendingCall>();
 	private nextId = 1;
 	private starting: Promise<void> | null = null;
 	private senderPackageB64: string | null = null;
 
-	constructor(private readonly seedBytes: Uint8Array | null) {}
+	constructor(
+		private readonly seedBytes: Uint8Array | null,
+		private readonly createWorker: DaveWorkerFactory = defaultDaveWorkerFactory,
+	) {}
 
 	isEnabled(): boolean {
 		return this.seedBytes !== null && this.seedBytes.length >= 16;
@@ -98,20 +128,34 @@ export class DaveSignerService {
 		if (this.worker !== null) {
 			return Promise.resolve();
 		}
-		if (this.starting !== null) {
-			return this.starting;
+		if (this.starting === null) {
+			const starting = this.spawn().catch((err: unknown) => {
+				// A failed startup must not linger: drop the memoized promise so
+				// the next caller retries with a fresh worker instead of being
+				// stuck on the same rejection forever.
+				if (this.starting === starting) {
+					this.starting = null;
+				}
+				throw err;
+			});
+			this.starting = starting;
 		}
-		this.starting = this.spawn();
 		return this.starting;
 	}
 
 	private async spawn(): Promise<void> {
-		const worker = new Worker(resolveWorkerPath());
+		const worker = this.createWorker();
+		this.startingWorker = worker;
 		worker.on('error', (err) => {
 			Logger.error({err}, 'DAVE signer worker crashed');
 			this.failAll(err instanceof Error ? err : new Error(String(err)));
 		});
 		worker.on('exit', (code) => {
+			// Ignore exits from stale workers whose slot was already replaced
+			// or disposed; touching state here would clobber a newer worker.
+			if (this.worker !== worker && this.startingWorker !== worker) {
+				return;
+			}
 			if (code !== 0) {
 				this.failAll(new Error(`DAVE signer worker exited with code ${String(code)}`));
 			}
@@ -119,7 +163,7 @@ export class DaveSignerService {
 			this.starting = null;
 			this.senderPackageB64 = null;
 		});
-		worker.on('message', (msg: {id: number; ok: boolean; value?: unknown; error?: string}) => {
+		worker.on('message', (msg) => {
 			const call = this.pending.get(msg.id);
 			if (call === undefined) {
 				return;
@@ -132,12 +176,25 @@ export class DaveSignerService {
 				call.reject(new Error(msg.error ?? 'DAVE worker returned an error'));
 			}
 		});
-		this.worker = worker;
-		const seedBytes = Array.from(this.seedBytes ?? new Uint8Array());
-		const result = (await this.callOn(worker, {op: 'init', seedBytes})) as {
-			senderPackage: number[];
-		};
-		this.senderPackageB64 = bytesToB64(result.senderPackage);
+		try {
+			const seedBytes = Array.from(this.seedBytes ?? new Uint8Array());
+			const result = (await this.callOn(worker, {op: 'init', seedBytes})) as {
+				senderPackage: number[];
+			};
+			// Only publish the worker after init succeeded: a worker that
+			// answered ok:false replies without exiting, so the exit cleanup
+			// below would never fire and the service would look started with a
+			// null sender package forever.
+			this.worker = worker;
+			this.senderPackageB64 = bytesToB64(result.senderPackage);
+		} catch (err) {
+			void worker.terminate();
+			throw err;
+		} finally {
+			if (this.startingWorker === worker) {
+				this.startingWorker = null;
+			}
+		}
 	}
 
 	private failAll(err: Error): void {
@@ -148,7 +205,7 @@ export class DaveSignerService {
 		this.pending.clear();
 	}
 
-	private callOn(worker: Worker, op: DaveOp): Promise<unknown> {
+	private callOn(worker: DaveWorkerHandle, op: DaveOp): Promise<unknown> {
 		const id = this.nextId++;
 		return new Promise<unknown>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -236,10 +293,57 @@ export class DaveSignerService {
 	}
 
 	dispose(): void {
-		if (this.worker !== null) {
-			void this.worker.terminate();
-			this.worker = null;
+		const worker = this.worker ?? this.startingWorker;
+		this.worker = null;
+		this.startingWorker = null;
+		this.starting = null;
+		this.senderPackageB64 = null;
+		if (worker !== null) {
+			void worker.terminate();
 		}
 		this.failAll(new Error('DAVE service disposed'));
 	}
+}
+
+let _daveSignerService: DaveSignerService | null | undefined;
+
+/** Accept either base64 (preferred) or raw UTF-8 secret as the seed. */
+function parseDaveSeed(seed: string): Uint8Array {
+	try {
+		const bytes = new Uint8Array(Buffer.from(seed, 'base64'));
+		if (bytes.length >= 16) {
+			return bytes;
+		}
+	} catch {
+		// Not valid base64; fall through to raw UTF-8.
+	}
+	return new Uint8Array(Buffer.from(seed, 'utf8'));
+}
+
+/**
+ * Process-wide lazy DAVE signer singleton. The seed is read once from
+ * Config.voice.daveSeed; the worker thread + WASM instance are shared by
+ * every request. Constructing one per HTTP request would leak a worker and
+ * ~2.3 MB of WASM each time, so RequestServices MUST go through this getter.
+ */
+export function getDaveSignerService(): DaveSignerService | null {
+	if (_daveSignerService === undefined) {
+		const seed = (Config.voice.daveSeed ?? '').trim();
+		_daveSignerService = seed.length === 0 ? null : new DaveSignerService(parseDaveSeed(seed));
+	}
+	return _daveSignerService;
+}
+
+/**
+ * Terminate the shared signer worker; called from the API graceful shutdown.
+ * The slot is reset to uninitialized (not a terminal null) so the getter keeps
+ * its single lazy-init semantics and tests stay order-independent: a late call
+ * after shutdown simply builds a fresh service from config instead of being
+ * locked out forever.
+ */
+export function shutdownDaveSignerService(): void {
+	if (_daveSignerService !== null && _daveSignerService !== undefined) {
+		_daveSignerService.dispose();
+	}
+	_daveSignerService = undefined;
 }

@@ -4,7 +4,7 @@
 // transparency log is not published, so we pin the delivery service's external
 // sender package per instance and surface a "broken" status if it ever changes.
 
-export type TofuStatus = 'unknown' | 'pinned' | 'broken';
+export type TofuStatus = 'unknown' | 'pinned' | 'broken' | 'unavailable';
 
 const STORAGE_PREFIX = 'fluxer.dave.sender.';
 
@@ -36,15 +36,22 @@ export class TofuStore {
 	 */
 	public verify(instanceKey: string, senderPackageB64: string): TofuStatus {
 		if (this.storage === null) {
-			// No persistent storage: cannot pin, treat as unknown-but-presented.
-			return senderPackageB64.length > 0 ? 'pinned' : 'unknown';
+			// No persistent storage: nothing was pinned, so key-change detection
+			// is not active. Report that honestly instead of a false 'pinned'.
+			return 'unavailable';
 		}
-		const existing = this.storage.getItem(this.key(instanceKey));
-		if (existing === null) {
-			this.storage.setItem(this.key(instanceKey), senderPackageB64);
-			return 'pinned';
+		try {
+			const existing = this.storage.getItem(this.key(instanceKey));
+			if (existing === null) {
+				this.storage.setItem(this.key(instanceKey), senderPackageB64);
+				return 'pinned';
+			}
+			return existing === senderPackageB64 ? 'pinned' : 'broken';
+		} catch {
+			// Storage exists but throws (quota exhausted, privacy mode): change
+			// detection cannot function.
+			return 'unavailable';
 		}
-		return existing === senderPackageB64 ? 'pinned' : 'broken';
 	}
 
 	public getPinned(instanceKey: string): string | null {

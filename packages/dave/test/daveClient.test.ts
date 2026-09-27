@@ -8,6 +8,20 @@
 import {beforeAll, describe, expect, test} from 'vitest';
 import {DaveNodeModuleFactory, type DaveNodeModule} from '@fluxer/libdave/delivery';
 import {DaveClient, type DaveUpMessage, type DaveTransport} from '../src/DaveClient.js';
+import {TofuStore} from '../src/tofuStore.js';
+
+class MemStorage {
+	private map = new Map<string, string>();
+	getItem(k: string): string | null {
+		return this.map.has(k) ? (this.map.get(k) as string) : null;
+	}
+	setItem(k: string, v: string): void {
+		this.map.set(k, v);
+	}
+	removeItem(k: string): void {
+		this.map.delete(k);
+	}
+}
 
 const GROUP = '999';
 const USER_A = '1000000000000000001';
@@ -45,8 +59,20 @@ test('two clients found a group via the relay and share a ratchet', () => {
 
 	const tA = new RecordingTransport();
 	const tB = new RecordingTransport();
-	const a = new DaveClient({mod, selfUserId: USER_A, channelId: GROUP, transport: tA});
-	const b = new DaveClient({mod, selfUserId: USER_B, channelId: GROUP, transport: tB});
+	const a = new DaveClient({
+		mod,
+		selfUserId: USER_A,
+		channelId: GROUP,
+		transport: tA,
+		tofu: new TofuStore(new MemStorage()),
+	});
+	const b = new DaveClient({
+		mod,
+		selfUserId: USER_B,
+		channelId: GROUP,
+		transport: tB,
+		tofu: new TofuStore(new MemStorage()),
+	});
 
 	// Join handshake.
 	a.onEvent({type: 'select_protocol_ack', version: 1});
@@ -91,9 +117,12 @@ test('two clients found a group via the relay and share a ratchet', () => {
 	expect(rA?.cipherSuite).toBe(2);
 	expect(rA?.baseSecret).toEqual(rB?.baseSecret);
 
-	// TOFU pinned on first sender presentation.
+	// TOFU pinned on first sender presentation; both clients report the group
+	// established after applying the winning commit / welcome.
 	expect(a.getTofuStatus()).toBe('pinned');
 	expect(b.getTofuStatus()).toBe('pinned');
+	expect(a.status).toBe('established');
+	expect(b.status).toBe('established');
 
 	a.destroy();
 	b.destroy();

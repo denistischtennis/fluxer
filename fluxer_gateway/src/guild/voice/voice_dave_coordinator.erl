@@ -13,6 +13,7 @@
 %%   established   :: boolean()          whether an MLS group is live
 %%   epoch         :: non_neg_integer()   current MLS epoch
 %%   key_packages  :: #{UserId => binary()}  accumulated client key packages
+%%   joined        :: #{UserId => true}  clients admitted via the join/negotiation path
 %%   roster        :: [#{user_id, leaf_index}]  last-known post-commit roster
 %%   transition    :: undefined | transition()
 %%   pending_removals :: [LeafIndex]     batched removal targets awaiting flush
@@ -29,7 +30,7 @@
 -typing([eqwalizer]).
 
 -export([
-    new_room_state/1,
+    new_room_state/2,
     handle/2
 ]).
 
@@ -65,6 +66,8 @@
     established => boolean(),
     epoch => non_neg_integer(),
     key_packages => #{user_id() => binary()},
+    pending_kps => #{user_id() => binary()},
+    joined => #{user_id() => true},
     roster := [roster_entry()],
     transition => undefined | transition(),
     pending_removals => [non_neg_integer()],
@@ -73,13 +76,16 @@
 
 %% @doc Fresh room state. `Established' reflects whether the channel already has
 %% an active MLS group (from persistence); callers start with `false'.
--spec new_room_state(boolean()) -> room_state().
-new_room_state(Established) ->
+-spec new_room_state(boolean(), binary()) -> room_state().
+new_room_state(Established, GroupIdBin) ->
     #{
+        group_id => GroupIdBin,
         version => 0,
         established => Established,
         epoch => 0,
         key_packages => #{},
+        pending_kps => #{},
+        joined => #{},
         roster => [],
         transition => undefined,
         pending_removals => [],
@@ -91,31 +97,73 @@ new_room_state(Established) ->
 %% --------------------------------------------------------------------------
 
 handle({join, UserId, MaxVersion}, State) when is_binary(UserId), is_integer(MaxVersion) ->
-    %% Choose the highest version supported by every e2ee-required participant.
-    %% For a new (unestablished) room the joiner's own max becomes the floor.
-    ExistingVersion = maps:get(version, State, 0),
-    Negotiated =
-        case ExistingVersion of
-            0 -> MaxVersion;
-            V -> min(V, MaxVersion)
-        end,
-    State1 = State#{version => Negotiated},
-    Ack = #{
-        type => select_protocol_ack,
-        version => Negotiated,
-        target_user_id => UserId
-    },
-    case Negotiated > 0 of
+    %% Record the admission. Opcode-17 client events are only honored for users
+    %% in this set; the join/move/token flows run their real permission checks
+    %% *before* driving {join, _, _} with the authenticated session user, so
+    %% membership here is itself the authorization proof.
+    Joined0 = maps:get(joined, State, #{}),
+    StateJ = State#{joined => Joined0#{UserId => true}},
+    ExistingVersion = maps:get(version, StateJ, 0),
+    Established = maps:get(established, StateJ, false),
+    case Established andalso ExistingVersion > 0 andalso MaxVersion < ExistingVersion of
         true ->
-            %% Ask the delivery service for the external sender package for this user.
+            %% A live MLS group is bound to its negotiated protocol version; a
+            %% member whose maximum sits below it cannot join that key schedule.
+            %% Per RFC 9296 the delivery service falls back: discard the group
+            %% and re-found at the new common floor instead of silently
+            %% corrupting the version under a live group.
+            Members = lists:usort(all_present_users(StateJ) ++ [UserId]),
+            State1 = StateJ#{
+                version => MaxVersion,
+                established => false,
+                epoch => 0,
+                transition => undefined,
+                key_packages => #{},
+                roster => [],
+                pending_removals => []
+            },
+            Reinit = [
+                {send_to_user, U, #{
+                    type => prepare_epoch,
+                    epoch => 1,
+                    version => MaxVersion
+                }}
+             || U <- Members, U =/= UserId
+            ],
+            Ack = #{
+                type => select_protocol_ack,
+                version => MaxVersion,
+                target_user_id => UserId
+            },
             Ref = make_ref(),
-            {State1, [
-                {send_to_user, UserId, Ack},
-                {dave_rpc, sender_package, #{}, {Ref, UserId}}
-            ]};
+            {State1, [{send_to_user, UserId, Ack} | Reinit] ++ [{dave_rpc, sender_package, #{}, {Ref, UserId}}]};
         false ->
-            %% Passthrough: no DAVE ops, just the ack with version 0.
-            {State1, [{send_to_user, UserId, Ack}]}
+            %% Choose the highest version supported by every e2ee-required
+            %% participant. For a new (unestablished) room the joiner's own
+            %% max becomes the floor.
+            Negotiated =
+                case ExistingVersion of
+                    0 -> MaxVersion;
+                    V -> min(V, MaxVersion)
+                end,
+            State1 = StateJ#{version => Negotiated},
+            Ack = #{
+                type => select_protocol_ack,
+                version => Negotiated,
+                target_user_id => UserId
+            },
+            case Negotiated > 0 of
+                true ->
+                    %% Ask the delivery service for the external sender package for this user.
+                    Ref = make_ref(),
+                    {State1, [
+                        {send_to_user, UserId, Ack},
+                        {dave_rpc, sender_package, #{}, {Ref, UserId}}
+                    ]};
+                false ->
+                    %% Passthrough: no DAVE ops, just the ack with version 0.
+                    {State1, [{send_to_user, UserId, Ack}]}
+            end
     end;
 
 %% --------------------------------------------------------------------------
@@ -133,17 +181,21 @@ handle({sender_package_result, UserId, SenderPkgB64}, State) ->
 %% Key package arrival — drives group founding or member-add.
 %% --------------------------------------------------------------------------
 handle({key_package, UserId, KpB64}, State) ->
-    Kps = maps:get(key_packages, State, #{}),
-    State1 = State#{key_packages => Kps#{UserId => KpB64}},
-    Established = maps:get(established, State1, false),
-    case Established of
-        false ->
-            %% Founding trigger: first key package starts the group with everyone
-            %% currently present whose key package we hold.
-            start_add_transition(State1, all_present_users(State1));
+    case is_admitted(UserId, State) of
         true ->
-            %% Already established: add this single user.
-            start_add_transition(State1, [UserId])
+            %% Park the package unvalidated and ask the delivery service to check
+            %% its signature, ciphersuite and identity binding. Only VALIDATED
+            %% key packages may ever be signed into MLS add proposals.
+            Pending = maps:get(pending_kps, State, #{}),
+            Ref = make_ref(),
+            {State#{pending_kps => Pending#{UserId => KpB64}}, [
+                {dave_rpc, validate_key_package, #{
+                    key_package_b64 => KpB64,
+                    user_id => UserId
+                }, {Ref, UserId}}
+            ]};
+        false ->
+            {State, [{log_warning, {dave_unauthorized_sender, key_package, UserId}}]}
     end;
 
 %% --------------------------------------------------------------------------
@@ -154,25 +206,19 @@ handle({proposals_created, ProposalsB64}, State) ->
         undefined ->
             {State, []};
         T = #{phase := preparing} ->
-            TargetUsers = maps:get(target_users, T, []),
-            %% Relay the signed external proposals to every target so each can
-            %% build a commit candidate.
+            %% Relay the signed external proposals with a single channel-wide
+            %% broadcast. The owner fans it out to every connected member, and
+            %% by construction every transition target is already a member
+            %% (their key package was promoted before create_proposals ran), so
+            %% per-target sends would only duplicate delivery — making each
+            %% target build two commit candidates and doubling DS parse work.
             Broadcast = {broadcast_channel, #{
                 type => proposals,
                 transition_id => maps:get(id, T),
                 data => ProposalsB64
             }},
-            Sends = [
-                {send_to_user, U, #{
-                    type => proposals,
-                    transition_id => maps:get(id, T),
-                    data => ProposalsB64
-                }}
-             || U <- TargetUsers
-            ],
-            Actions = [Broadcast | Sends],
             T1 = T#{proposals_b64 => ProposalsB64, phase => awaiting_commit},
-            {State#{transition => T1}, Actions}
+            {State#{transition => T1}, [Broadcast]}
     end;
 
 %% --------------------------------------------------------------------------
@@ -180,26 +226,31 @@ handle({proposals_created, ProposalsB64}, State) ->
 %% The parse result arrives via {commit_parsed, ...}.
 %% --------------------------------------------------------------------------
 handle({commit_welcome, CommitterId, BundleB64}, State) ->
-    case maps:get(transition, State, undefined) of
-        T = #{phase := awaiting_commit, proposals_b64 := ProposalsB64} ->
-            Epoch = maps:get(epoch, State, 0),
-            KnownRoster = maps:get(roster, State, []),
-            Ref = make_ref(),
-            %% Remember who committed so the parsed handler can exclude them
-            %% from welcome targets (they joined via their own commit).
-            State1 = State#{transition => T#{initiated_by => CommitterId}},
-            {State1, [
-                {dave_rpc, parse_commit, #{
-                    group_id => maps:get(group_id, State, <<>>),
-                    expected_epoch => Epoch,
-                    committer_user_id => CommitterId,
-                    commit_welcome_b64 => BundleB64,
-                    pending_proposals_b64 => ProposalsB64,
-                    known_roster => KnownRoster
-                }, {Ref, CommitterId}}
-            ]};
-        _ ->
-            {State, []}
+    case is_admitted(CommitterId, State) of
+        false ->
+            {State, [{log_warning, {dave_unauthorized_sender, commit_welcome, CommitterId}}]};
+        true ->
+            case maps:get(transition, State, undefined) of
+                T = #{phase := awaiting_commit, proposals_b64 := ProposalsB64} ->
+                    Epoch = maps:get(epoch, State, 0),
+                    KnownRoster = maps:get(roster, State, []),
+                    Ref = make_ref(),
+                    %% Remember who committed so the parsed handler can exclude them
+                    %% from welcome targets (they joined via their own commit).
+                    State1 = State#{transition => T#{initiated_by => CommitterId}},
+                    {State1, [
+                        {dave_rpc, parse_commit, #{
+                            group_id => maps:get(group_id, State, <<>>),
+                            expected_epoch => Epoch,
+                            committer_user_id => CommitterId,
+                            commit_welcome_b64 => BundleB64,
+                            pending_proposals_b64 => ProposalsB64,
+                            known_roster => KnownRoster
+                        }, {Ref, CommitterId}}
+                    ]};
+                _ ->
+                    {State, []}
+            end
     end;
 
 %% First valid parsed commit wins the epoch.
@@ -209,15 +260,20 @@ handle({commit_parsed, ok, Parsed}, State) ->
     Roster = maps:get(roster, Parsed, maps:get(roster, State, [])),
     WelcomeB64 = maps:get(welcome_b64, Parsed, undefined),
     CommitB64 = maps:get(commit_b64, Parsed, <<>>),
-    %% Announce the winning commit transition to all members; welcome only to adds.
+    %% The DAVE delivery service echoes the winning commit to every connected
+    %% participant, the committer included: clients only *apply* the winning
+    %% commit through this echo (ProcessProposals merely builds a candidate),
+    %% so any excluded member would stay on the old epoch and fail to decrypt
+    %% post-transition media. Welcomes go only to the newly added members.
     TargetUsers = target_users_for(T),
+    EchoUsers = lists:usort(all_present_users(State) ++ TargetUsers),
     Announce = [
         {send_to_user, U, #{
             type => announce_commit_transition,
             transition_id => trans_id(T),
             data => CommitB64
         }}
-     || U <- TargetUsers
+     || U <- EchoUsers
     ],
     Welcomes =
         case WelcomeB64 of
@@ -251,20 +307,25 @@ handle({commit_parsed, error, _Reason}, State) ->
 %% Transition readiness counting.
 %% --------------------------------------------------------------------------
 handle({ready_for_transition, UserId, TransitionId}, State) ->
-    case maps:get(transition, State, undefined) of
-        T = #{id := TransitionId, ready_set := Ready} ->
-            Ready1 = Ready#{UserId => true},
-            TargetUsers = target_users_for(T),
-            AllReady = lists:all(fun(U) -> maps:is_key(U, Ready1) end, TargetUsers),
-            T1 = T#{ready_set => Ready1},
-            case AllReady of
-                true ->
-                    execute_transition(State#{transition => T1});
-                false ->
-                    {State#{transition => T1}, []}
-            end;
-        _ ->
-            {State, []}
+    case is_admitted(UserId, State) of
+        false ->
+            {State, [{log_warning, {dave_unauthorized_sender, ready_for_transition, UserId}}]};
+        true ->
+            case maps:get(transition, State, undefined) of
+                T = #{id := TransitionId, ready_set := Ready} ->
+                    Ready1 = Ready#{UserId => true},
+                    TargetUsers = target_users_for(T),
+                    AllReady = lists:all(fun(U) -> maps:is_key(U, Ready1) end, TargetUsers),
+                    T1 = T#{ready_set => Ready1},
+                    case AllReady of
+                        true ->
+                            execute_transition(State#{transition => T1});
+                        false ->
+                            {State#{transition => T1}, []}
+                    end;
+                _ ->
+                    {State, []}
+            end
     end;
 
 %% Deadline elapsed (host timer fired) — force-execute if we still have a live
@@ -281,29 +342,51 @@ handle({transition_timeout, TransitionId}, State) ->
 %% Invalid commit/welcome from any member -> discard current transition and
 %% restart with prepare_epoch(1); everyone resubmits key packages.
 %% --------------------------------------------------------------------------
-handle({invalid_commit_welcome, _UserId}, State) ->
-    Members = all_present_users(State),
-    State1 = State#{
-        established => false,
-        epoch => 1,
-        transition => undefined,
-        key_packages => #{}
-    },
-    Actions = [
-        {send_to_user, U, #{type => prepare_epoch, epoch => 1, version => maps:get(version, State, 0)}}
-     || U <- Members
-    ],
-    {State1, Actions};
+handle({invalid_commit_welcome, UserId}, State) ->
+    case is_admitted(UserId, State) of
+        false ->
+            {State, [{log_warning, {dave_unauthorized_sender, invalid_commit_welcome, UserId}}]};
+        true ->
+            Members = all_present_users(State),
+            State1 = State#{
+                established => false,
+                %% The wire epoch `1' below signals "found a brand-new group"; that
+                %% group starts at MLS epoch 0, so the internal counter must be 0
+                %% as well — otherwise the next round of external proposals gets
+                %% signed for epoch 1, every client rejects the epoch binding, and
+                %% the room can never re-found itself.
+                epoch => 0,
+                transition => undefined,
+                key_packages => #{},
+                pending_kps => #{},
+                roster => [],
+                pending_removals => []
+            },
+            Actions = [
+                {send_to_user, U, #{type => prepare_epoch, epoch => 1, version => maps:get(version, State, 0)}}
+             || U <- Members
+            ],
+            {State1, Actions}
+    end;
 
 %% --------------------------------------------------------------------------
 %% Sole-member reset: only one member remains -> prepare_epoch(1) + prepare(0).
 %% --------------------------------------------------------------------------
 handle({member_left, UserId}, State) ->
-    Members = all_present_users(State),
+    %% Retire the departed user's admission and key package right away: ghosts
+    %% in `joined' would keep passing the authorization gate, and ghosts in
+    %% `key_packages' would count as present for future founding rounds and
+    %% echo broadcasts.
+    StateR = State#{
+        joined => maps:remove(UserId, maps:get(joined, State, #{})),
+        key_packages => maps:remove(UserId, maps:get(key_packages, State, #{})),
+        pending_kps => maps:remove(UserId, maps:get(pending_kps, State, #{}))
+    },
+    Members = all_present_users(StateR),
     Remaining = Members -- [UserId],
-    case length(Remaining) =< 1 andalso maps:get(established, State, false) of
+    case length(Remaining) =< 1 andalso maps:get(established, StateR, false) of
         true ->
-            State1 = reset_to_unestablished(State),
+            State1 = reset_to_unestablished(StateR),
             Actions =
                 case Remaining of
                     [Only] ->
@@ -311,12 +394,12 @@ handle({member_left, UserId}, State) ->
                             {send_to_user, Only, #{
                                 type => prepare_epoch,
                                 epoch => 1,
-                                version => maps:get(version, State, 0)
+                                version => maps:get(version, StateR, 0)
                             }},
                             {send_to_user, Only, #{
                                 type => prepare_transition,
                                 transition_id => ?K_INIT_TRANSITION_ID,
-                                version => maps:get(version, State, 0)
+                                version => maps:get(version, StateR, 0)
                             }}
                         ];
                     [] ->
@@ -325,7 +408,7 @@ handle({member_left, UserId}, State) ->
             {State1, Actions};
         false ->
             %% Not the sole-member case: schedule a removal of the departed leaf.
-            schedule_removal(UserId, State)
+            schedule_removal(UserId, StateR)
     end;
 
 %% Flush the batched removal window -> create the remove proposals.
@@ -338,13 +421,33 @@ handle(flush_removals, State) ->
             start_remove_transition(State1, Indices)
     end;
 
-%% A validate-key-package result reported back by the host.
-handle({validate_key_package_result, _UserId, #{valid := true}}, State) ->
-    {State, []};
+%% A validate-key-package result reported back by the host. Validation success
+%% promotes the parked package into the live set and drives founding / member-add.
+handle({validate_key_package_result, UserId, #{valid := true}}, State) ->
+    Pending = maps:get(pending_kps, State, #{}),
+    case maps:take(UserId, Pending) of
+        {KpB64, Pending1} ->
+            Kps = maps:get(key_packages, State, #{}),
+            State1 = State#{pending_kps => Pending1, key_packages => Kps#{UserId => KpB64}},
+            Established = maps:get(established, State1, false),
+            case Established of
+                false ->
+                    %% Founding trigger: first validated key package starts the
+                    %% group with everyone validated so far.
+                    start_add_transition(State1, all_present_users(State1));
+                true ->
+                    %% Already established: add this single user.
+                    start_add_transition(State1, [UserId])
+            end;
+        error ->
+            %% Stale or duplicate result; ignore.
+            {State, []}
+    end;
 handle({validate_key_package_result, UserId, #{valid := false, reason := Reason}}, State) ->
     %% Drop the offending key package; nothing else to do (client will retry).
-    Kps = maps:get(key_packages, State, #{}),
-    {State#{key_packages => maps:remove(UserId, Kps)}, [{log_warning, {bad_key_package, UserId, Reason}}]}.
+    Pending = maps:get(pending_kps, State, #{}),
+    {State#{pending_kps => maps:remove(UserId, Pending)},
+        [{log_warning, {bad_key_package, UserId, Reason}}]}.
 
 %% --------------------------------------------------------------------------
 %% Internal helpers
@@ -444,6 +547,12 @@ all_present_users(State) ->
     %% Users with a key package are the connected set for protocol purposes.
     maps:keys(maps:get(key_packages, State, #{})).
 
+%% Users admitted through the owning process' join/negotiation path. Client
+%% originated opcode-17 events are only honored for members of this set.
+-spec is_admitted(user_id(), room_state()) -> boolean().
+is_admitted(UserId, State) ->
+    maps:is_key(UserId, maps:get(joined, State, #{})).
+
 added_users(NewRoster, OldRoster) ->
     OldIds = [U || #{user_id := U} <- OldRoster],
     [U || #{user_id := U} <- NewRoster, not lists:member(U, OldIds)].
@@ -496,7 +605,7 @@ count_type(Actions, Type) ->
     ]).
 
 negotiation_test() ->
-    S0 = new_room_state(false),
+    S0 = new_room_state(false, <<"42">>),
     %% New room adopts the joiner's max version and requests the sender package.
     {S1, A1} = handle({join, <<"1001">>, 1}, S0),
     ?assertEqual(1, maps:get(version, S1)),
@@ -510,18 +619,20 @@ negotiation_test() ->
     ?assertEqual(0, maps:get(version, Ack2)).
 
 passthrough_no_sender_package_test() ->
-    S0 = new_room_state(false),
+    S0 = new_room_state(false, <<"42">>),
     {S1, A1} = handle({join, <<"1001">>, 0}, S0),
     ?assertEqual(0, maps:get(version, S1)),
     ?assertNot(has_rpc(A1, sender_package)),
     ?assertEqual(1, length(A1)).
 
 founding_from_first_key_package_test() ->
-    S0 = (new_room_state(false))#{
+    S0 = (new_room_state(false, <<"42">>))#{
         version => 1,
-        key_packages => #{<<"1001">> => <<"KPA">>}
+        joined => #{<<"1001">> => true, <<"1002">> => true},
+        key_packages => #{<<"1001">> => <<"KPA">>},
+        pending_kps => #{<<"1002">> => <<"KPB">>}
     },
-    {S1, A1} = handle({key_package, <<"1002">>, <<"KPB">>}, S0),
+    {S1, A1} = handle({validate_key_package_result, <<"1002">>, #{valid => true}}, S0),
     %% Founding: not yet established -> add transition targeting present users.
     T = maps:get(transition, S1),
     ?assertEqual(preparing, maps:get(phase, T)),
@@ -577,8 +688,55 @@ invalid_commit_welcome_reinitializes_test() ->
     S0 = established_state(),
     {S1, A1} = handle({invalid_commit_welcome, <<"1002">>}, S0),
     ?assertEqual(false, maps:get(established, S1)),
-    ?assertEqual(1, maps:get(epoch, S1)),
+    %% The internal MLS epoch must be 0 after a reset: the wire prepare_epoch(1)
+    %% means "found a brand-new group", and a fresh MLS group starts at epoch 0.
+    %% Signing the next external proposals at any other epoch strands the room
+    %% (every client rejects the epoch binding).
+    ?assertEqual(0, maps:get(epoch, S1)),
+    ?assertEqual([], maps:get(roster, S1)),
+    ?assertEqual([], maps:get(pending_removals, S1)),
     ?assert(count_type(A1, prepare_epoch) >= 1).
+
+established_add_echoes_winning_commit_to_all_members_test() ->
+    %% A/B live in an established room; C joins. The winning commit produced by
+    %% A must be echoed back to A *and* B, not only to the add target C —
+    %% clients apply the winning commit exclusively through this echo.
+    S0 = established_two_users(),
+    {SJ, _JA} = handle({join, <<"1003">>, 1}, S0),
+    {SK, _JK} = handle({key_package, <<"1003">>, <<"KPC">>}, SJ),
+    {S1, _} = handle({validate_key_package_result, <<"1003">>, #{valid => true}}, SK),
+    {S2, _} = handle({proposals_created, <<"PROP">>}, S1),
+    {S3, _} = handle({commit_welcome, <<"1001">>, <<"CW">>}, S2),
+    Parsed = #{
+        new_epoch => 2,
+        roster => [
+            #{user_id => <<"1001">>, leaf_index => 0},
+            #{user_id => <<"1002">>, leaf_index => 1},
+            #{user_id => <<"1003">>, leaf_index => 2}
+        ],
+        commit_b64 => <<"COMMIT">>,
+        welcome_b64 => <<"WELCOME">>
+    },
+    {S4, A4} = handle({commit_parsed, ok, Parsed}, S3),
+    AnnouncedTo = lists:usort([
+        U || {send_to_user, U, P} <- A4, maps:get(type, P) =:= announce_commit_transition
+    ]),
+    WelcomedTo = lists:usort([
+        U || {send_to_user, U, P} <- A4, maps:get(type, P) =:= welcome
+    ]),
+    ?assertEqual([<<"1001">>, <<"1002">>, <<"1003">>], AnnouncedTo),
+    ?assertEqual([<<"1003">>], WelcomedTo),
+    ?assertEqual(2, maps:get(epoch, S4)).
+
+reset_then_key_package_refounds_at_mls_epoch_zero_test() ->
+    S0 = established_state(),
+    {S1, _} = handle({invalid_commit_welcome, <<"1002">>}, S0),
+    {S2, A2} = handle({key_package, <<"1001">>, <<"KP2">>}, S1),
+    ?assert(has_rpc(A2, validate_key_package)),
+    {_S3, A3} = handle({validate_key_package_result, <<"1001">>, #{valid => true}}, S2),
+    ?assert(has_rpc(A3, create_proposals)),
+    {Args, _} = rpc_args(A3, create_proposals),
+    ?assertEqual(0, maps:get(epoch, Args)).
 
 sole_member_reset_test() ->
     S0 = established_two_users(),
@@ -600,16 +758,82 @@ non_sole_leave_batches_removal_test() ->
     ?assertEqual([], maps:get(add_b64, Args)).
 
 bad_key_package_dropped_test() ->
-    S0 = (new_room_state(true))#{key_packages => #{<<"1001">> => <<"KP">>}},
+    S0 = (new_room_state(true, <<"42">>))#{pending_kps => #{<<"1001">> => <<"KP">>}},
     {S1, A1} = handle({validate_key_package_result, <<"1001">>, #{valid => false, reason => <<"bad">>}}, S0),
-    ?assertEqual(#{}, maps:get(key_packages, S1)),
+    ?assertEqual(#{}, maps:get(pending_kps, S1)),
     ?assert(lists:any(fun({log_warning, _}) -> true; (_) -> false end, A1)).
+
+unvalidated_key_package_is_never_signed_into_adds_test() ->
+    %% A key package must pass the DS validation round-trip before any add
+    %% proposal referencing it can be created.
+    S0 = established_state(),
+    {S1, A1} = handle({key_package, <<"1001">>, <<"EVIL">>}, S0),
+    ?assert(has_rpc(A1, validate_key_package)),
+    ?assertNot(has_rpc(A1, create_proposals)),
+    ?assertEqual(maps:get(key_packages, S0), maps:get(key_packages, S1)),
+    {S2, A2} = handle({validate_key_package_result, <<"1001">>, #{valid => false, reason => <<"nope">>}}, S1),
+    ?assertEqual(#{}, maps:get(pending_kps, S2)),
+    ?assertNot(has_rpc(A2, create_proposals)).
+
+
+unauthorized_client_events_are_dropped_test() ->
+    %% A user who never went through the join/negotiation path must not be able
+    %% to drive the room: key packages, commits, readiness and invalid-commit
+    %% reports all get dropped with a warning instead of mutating state.
+    S0 = established_state(),
+    {S1, A1} = handle({key_package, <<"9999">>, <<"KPX">>}, S0),
+    ?assertEqual(S0, S1),
+    ?assert(lists:any(
+        fun({log_warning, {dave_unauthorized_sender, key_package, <<"9999">>}}) -> true; (_) -> false end,
+        A1
+    )),
+    {S2, _A2} = handle({commit_welcome, <<"9999">>, <<"CW">>}, S0),
+    ?assertEqual(S0, S2),
+    {S3, _A3} = handle({invalid_commit_welcome, <<"9999">>}, S0),
+    ?assertEqual(S0, S3),
+    {S4, _A4} = handle({ready_for_transition, <<"9999">>, 1}, S0),
+    ?assertEqual(S0, S4).
+
+lower_version_joiner_triggers_fallback_refoundation_test() ->
+    %% An established v2 room with a v1-only joiner must fall back per RFC 9296:
+    %% tear the group down, re-found at the new common floor, and keep the
+    %% joiner's admission so their key package is accepted.
+    S0 = (established_two_users())#{version => 2},
+    {S1, A1} = handle({join, <<"1003">>, 1}, S0),
+    ?assertEqual(1, maps:get(version, S1)),
+    ?assertEqual(false, maps:get(established, S1)),
+    ?assertEqual(0, maps:get(epoch, S1)),
+    ?assertEqual([], maps:get(roster, S1)),
+    Reinit = lists:sort([
+        U || {send_to_user, U, P} <- A1, maps:get(type, P) =:= prepare_epoch
+    ]),
+    ?assertEqual([<<"1001">>, <<"1002">>], Reinit),
+    ?assertEqual(1, count_type(A1, select_protocol_ack)),
+    ?assert(has_rpc(A1, sender_package)),
+    %% The joiner is admitted: their key package enters the validation queue.
+    {S2, A2} = handle({key_package, <<"1003">>, <<"KPC">>}, S1),
+    ?assert(has_rpc(A2, validate_key_package)),
+    ?assert(maps:is_key(<<"1003">>, maps:get(pending_kps, S2))).
+
+member_left_retires_admission_and_key_package_test() ->
+    S0 = established_three_users(),
+    {S1, _A1} = handle({member_left, <<"1003">>}, S0),
+    ?assertNot(maps:is_key(<<"1003">>, maps:get(joined, S1))),
+    ?assertNot(maps:is_key(<<"1003">>, maps:get(key_packages, S1))),
+    %% And afterwards they cannot drive the room anymore.
+    {S2, A2} = handle({key_package, <<"1003">>, <<"KPC2">>}, S1),
+    ?assertEqual(S1, S2),
+    ?assert(lists:any(
+        fun({log_warning, {dave_unauthorized_sender, key_package, <<"1003">>}}) -> true; (_) -> false end,
+        A2
+    )).
 
 %% --- test fixtures -------------------------------------------------------
 
 founding_state() ->
-    (new_room_state(false))#{
+    (new_room_state(false, <<"42">>))#{
         version => 1,
+        joined => #{<<"1001">> => true, <<"1002">> => true},
         key_packages => #{<<"1001">> => <<"KPA">>, <<"1002">> => <<"KPB">>},
         transition => #{
             id => 1,
@@ -631,9 +855,10 @@ ready_targets_state() ->
     awaiting_commit_state().
 
 established_state() ->
-    (new_room_state(true))#{
+    (new_room_state(true, <<"42">>))#{
         version => 1,
         epoch => 1,
+        joined => #{<<"1001">> => true, <<"1002">> => true},
         key_packages => #{<<"1001">> => <<"KPA">>, <<"1002">> => <<"KPB">>},
         roster => [
             #{user_id => <<"1001">>, leaf_index => 0},
@@ -647,6 +872,7 @@ established_two_users() ->
 established_three_users() ->
     S = established_state(),
     S#{
+        joined => maps:put(<<"1003">>, true, maps:get(joined, S)),
         key_packages => maps:put(<<"1003">>, <<"KPC">>, maps:get(key_packages, S)),
         roster => maps:get(roster, S) ++ [#{user_id => <<"1003">>, leaf_index => 2}]
     }.

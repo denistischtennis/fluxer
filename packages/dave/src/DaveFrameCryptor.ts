@@ -3,8 +3,11 @@
 // DaveFrameCryptor: the frame-level crypto primitive the patched livekit e2ee
 // worker delegates to. Wraps libdave's `Encryptor` (send) and per-sender
 // `Decryptor` (receive), handling the WASM heap dance and the no-ratchet
-// fallbacks the plan mandates:
-//   - Send with no ratchet: audio -> Opus silence packet, video -> passthrough.
+// worker fallbacks the plan mandates (all FAIL-CLOSED: plaintext media must
+// never reach the wire in a DAVE room):
+//   - Send with no ratchet: audio -> Opus silence packet, video -> drop.
+//   - Send where Encrypt() wrote nothing (missing codec mapping, nonce issues):
+//     drop the frame.
 //   - Receive with decrypt failure and passthrough active -> return original.
 //
 // The class is transport-agnostic and holds no timers; transition expiry windows
@@ -67,8 +70,9 @@ export class DaveSendCryptor {
 			if (mediaType === MEDIA_TYPE_AUDIO) {
 				return {bytes: Uint8Array.from(kOpusSilencePacket), encrypted: false};
 			}
-			// Video without a ratchet: passthrough unchanged.
-			return {bytes: plaintext, encrypted: false};
+			// Video without a ratchet: drop. Forwarding the original buffer would
+			// leak cleartext into a room the app has marked DAVE-encrypted.
+			return {bytes: new Uint8Array(), encrypted: false};
 		}
 
 		const maxCap = this.encryptor.GetMaxCiphertextByteSize(
@@ -86,7 +90,9 @@ export class DaveSendCryptor {
 				maxCap,
 			);
 			if (written === 0) {
-				return {bytes: plaintext, encrypted: false};
+				// Encryption failed (e.g. unknown SSRC/codec mapping); drop the
+				// frame rather than leaking plaintext.
+				return {bytes: new Uint8Array(), encrypted: false};
 			}
 			return {bytes: toU8(this.mod.HEAPU8.slice(ptr, ptr + written)), encrypted: true};
 		} finally {
