@@ -379,8 +379,11 @@ member_left_schedules_removal_test() ->
     ?assertEqual([1], maps:get(pending_removals, S1)),
     ok.
 
-%% sole-member reset emits prepare_epoch + prepare_transition to the only user.
-sole_member_reset_test() ->
+%% Leaving a two-person room must NOT tear the group down: the stayer keeps the
+%% live group and only the departed leaf is scheduled for removal. The old
+%% sole-reset wiped the stayer's key material, so a later rejoin of the
+%% departed user founded an isolated group nobody could share audio with.
+peer_exit_keeps_group_and_schedules_removal_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
     S0 = voice_dave_coordinator:new_room_state(true, <<"42">>),
@@ -393,10 +396,18 @@ sole_member_reset_test() ->
     },
     S1 = apply_event({member_left, <<"1002">>, <<"conn-1002">>}, S0b, Ctx),
     Recorded = get_recorded(Rec),
-    ?assertEqual(false, maps:get(established, S1)),
-    Types = [maps:get(type, P, undefined) || {send, <<"1001">>, P} <- Recorded],
-    ?assert(lists:member(prepare_epoch, Types) orelse lists:member(<<"prepare_epoch">>, Types)),
-    ?assert(lists:member(prepare_transition, Types) orelse lists:member(<<"prepare_transition">>, Types)),
+    %% The group survives and the stayer's key package is untouched.
+    ?assertEqual(true, maps:get(established, S1)),
+    ?assert(maps:is_key(<<"1001">>, maps:get(key_packages, S1))),
+    %% Only the departed leaf is queued for a batched removal.
+    ?assertEqual([1], maps:get(pending_removals, S1)),
+    ?assert(lists:any(fun({timer, flush_removals, _}) -> true; (_) -> false end, Recorded)),
+    %% No epoch-reset broadcast to the stayer.
+    Prepares = [
+        P
+     || {send, <<"1001">>, P} <- Recorded, maps:get(type, P, undefined) =:= <<"prepare_epoch">>
+    ],
+    ?assertEqual(0, length(Prepares)),
     ok.
 
 %% --- rpc_event mapping ---------------------------------------------------

@@ -153,7 +153,22 @@ handle({join, UserId, MaxVersion, ConnId}, State) when is_binary(UserId), is_int
                         StateB;
                     true ->
                         OldLeaf = find_leaf(UserId, maps:get(roster, StateB, [])),
-                        StateB#{replace_pending => maps:put(UserId, OldLeaf, maps:get(replace_pending, StateB, #{}))}
+                        %% The atomic replace transition removes this stale
+                        %% leaf itself. Drop it from the batched removal window
+                        %% so a later flush cannot remove whatever new leaf
+                        %% ends up at that index after the flip.
+                        CleanedRemovals =
+                            case OldLeaf of
+                                undefined ->
+                                    maps:get(pending_removals, StateB, []);
+                                LI ->
+                                    [X || X <- maps:get(pending_removals, StateB, []), X =/= LI]
+                            end,
+                        StateB#{
+                            pending_removals => CleanedRemovals,
+                            replace_pending =>
+                                maps:put(UserId, OldLeaf, maps:get(replace_pending, StateB, #{}))
+                        }
                 end,
             negotiate_join_version(StateC, UserId, MaxVersion)
     end;
@@ -429,30 +444,19 @@ handle({member_left, UserId, ConnId}, State) ->
             },
             Members = all_present_users(StateR),
             Remaining = Members -- [UserId],
-            case length(Remaining) =< 1 andalso maps:get(established, StateR, false) of
+            case Remaining =:= [] andalso maps:get(established, StateR, false) of
                 true ->
-                    State1 = reset_to_unestablished(StateR),
-                    Actions =
-                        case Remaining of
-                            [Only] ->
-                                [
-                                    {send_to_user, Only, #{
-                                        type => prepare_epoch,
-                                        epoch => 1,
-                                        version => maps:get(version, StateR, 0)
-                                    }},
-                                    {send_to_user, Only, #{
-                                        type => prepare_transition,
-                                        transition_id => ?K_INIT_TRANSITION_ID,
-                                        version => maps:get(version, StateR, 0)
-                                    }}
-                                ];
-                            [] ->
-                                []
-                        end,
-                    {State1, Actions};
+                    %% The last connected member is gone: nothing remains to
+                    %% maintain the group, so tear it down for a clean future
+                    %% founding.
+                    {reset_to_unestablished(StateR), []};
                 false ->
-                    %% Not the sole-member case: schedule a removal of the departed leaf.
+                    %% Stayers remain. Keep the live group intact and schedule
+                    %% only the departed leaf for removal. Tearing the whole
+                    %% room down here (the old sole-reset) wiped the stayers'
+                    %% key packages, so a later rejoin of the departed user
+                    %% founds a brand-new group the stayer is never added back
+                    %% to — two isolated MLS groups with no audio either way.
                     schedule_removal(UserId, StateR)
             end;
         Other ->
@@ -1168,6 +1172,39 @@ stale_member_left_ignored_after_rejoin_test() ->
         fun({log_warning, {dave_stale_member_left_ignored, _, _}}) -> true; (_) -> false end,
         A1
     )).
+
+%% --- reported repro: admin joins, admin2 joins, admin leaves then REJOINS ------
+%% When a member departs a two-person room, the remaining member must KEEP the
+%% live group. Tearing it down (reset_to_unestablished) wipes the stayers' key
+%% packages, so a subsequent rejoin of the departed user founds a brand-new
+%% group that the stayer is never added back to -> two isolated MLS groups and
+%% no audio either direction. The correct behaviour is to schedule the departed
+%% leaf for removal (group survives) and let the rejoin flip the representation
+%% atomically via a replace transition.
+rejoin_after_peer_exit_joins_same_group_test() ->
+    S0 = established_two_users(),
+    %% 1001 (admin) leaves; 1002 (admin2) stays connected.
+    {S1, _A1} = handle({member_left, <<"1001">>, <<"c1001">>}, S0),
+    %% The group must NOT be destroyed while a member remains.
+    ?assertEqual(true, maps:get(established, S1)),
+    %% 1002's key package must survive so it can still be committed/welcome-d.
+    ?assert(maps:is_key(<<"1002">>, maps:get(key_packages, S1))),
+    %% 1001's own material is retired (they are gone until they rejoin).
+    ?assertNot(maps:is_key(<<"1001">>, maps:get(joined, S1))),
+    %% 1001 rejoins with a fresh connection generation.
+    {S2, _A2} = handle({join, <<"1001">>, 1, <<"c1001b">>}, S1),
+    {S3, _A3} = handle({key_package, <<"1001">>, <<"KPA2">>}, S2),
+    {_S4, A4} = handle({validate_key_package_result, <<"1001">>, #{valid => true}}, S3),
+    %% A single combined remove-old-leaf + add-new-KP transition fires.
+    {Args, _} = rpc_args(A4, create_proposals),
+    ?assertEqual([<<"KPA2">>], maps:get(add_b64, Args)),
+    %% The old admin leaf (0) is removed in the same bundle.
+    ?assertEqual([0], maps:get(remove_indices, Args)),
+    %% The transition welcomes 1001 and its ready targets include the stayer 1002,
+    %% proving both end up in ONE group rather than two isolated ones.
+    T = maps:get(transition, _S4),
+    ?assertEqual([<<"1001">>], maps:get(added_users, T)),
+    ?assert(lists:member(<<"1002">>, maps:get(target_users, T))).
 
 %% Fast rejoin while the previous incarnation is still rostered: the old key
 %% package is retired immediately, the replacement intent recorded, and once
