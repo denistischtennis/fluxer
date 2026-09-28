@@ -19,9 +19,9 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    negotiate_join/3,
+    negotiate_join/4,
     handle_message/3,
-    member_left/2,
+    member_left/3,
     room/1
 ]).
 
@@ -39,11 +39,11 @@ room(State) ->
 %% Join negotiation for a participant entering the call's voice channel.
 %% Returns the negotiated protocol version (`null' when the call has no usable
 %% channel id, which cannot happen for a live call but is handled defensively).
--spec negotiate_join(user_id(), non_neg_integer(), call_state()) ->
+-spec negotiate_join(user_id(), non_neg_integer(), binary() | integer(), call_state()) ->
     {ok, non_neg_integer(), call_state()} | {error, term(), call_state()}.
-negotiate_join(UserBin, MaxVersion, State) ->
+negotiate_join(UserBin, MaxVersion, ConnId, State) ->
     case channel_key_safe(State) of
-        {ok, ChIdBin} -> guild_voice_dave:negotiate_join(UserBin, MaxVersion, ChIdBin, State);
+        {ok, ChIdBin} -> guild_voice_dave:negotiate_join(UserBin, MaxVersion, ConnId, ChIdBin, State);
         error -> {error, no_channel_id, State}
     end.
 
@@ -70,15 +70,15 @@ handle_message(Raw, SenderBin, State) ->
     end.
 
 %% Remove a departed participant from the call's MLS group.
--spec member_left(user_id(), call_state()) -> call_state().
-member_left(UserBin, State) ->
+-spec member_left(user_id(), binary() | integer() | undefined, call_state()) -> call_state().
+member_left(UserBin, ConnId, State) ->
     case channel_key_safe(State) of
         {ok, ChIdBin} ->
             case room_in(ChIdBin, State) of
                 undefined ->
                     State;
                 Room ->
-                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, Room) of
+                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, ConnId, Room) of
                         NewRoom -> put_room(ChIdBin, NewRoom, State)
                     catch
                         Class:Reason ->
@@ -127,7 +127,7 @@ channel_key_safe_accepts_integer_and_binary_channel_ids_test() ->
     ?assertEqual(error, channel_key_safe(#{channel_id => <<>>})).
 
 missing_channel_id_is_not_negotiable_test() ->
-    ?assertEqual({error, no_channel_id, #{region => x}}, negotiate_join(<<"1">>, 1, #{region => x})),
+    ?assertEqual({error, no_channel_id, #{region => x}}, negotiate_join(<<"1">>, 1, <<"c1">>, #{region => x})),
     ?assertEqual(error, channel_key_safe(#{})).
 
 room_absent_until_first_write_test() ->
@@ -148,7 +148,7 @@ negotiate_join_stores_room_impl() ->
             call,
             fun(_) -> {ok, #{<<"sender_package_b64">> => <<"S">>}} end
         ),
-        {ok, Version, NewState} = negotiate_join(<<"1001">>, 1, #{channel_id => 555}),
+        {ok, Version, NewState} = negotiate_join(<<"1001">>, 1, <<"c1001">>, #{channel_id => 555}),
         ?assertEqual(1, Version),
         Room = room(NewState),
         ?assert(is_map(Room)),
@@ -162,12 +162,12 @@ negotiate_join_stores_room_impl() ->
 
 member_left_without_room_is_a_noop_test() ->
     State = #{channel_id => 777},
-    ?assertEqual(State, member_left(<<"1">>, State)).
+    ?assertEqual(State, member_left(<<"1">>, <<"c1">>, State)).
 
 handle_message_without_channel_id_returns_state_unchanged_test() ->
     ?assertEqual(#{}, handle_message(#{<<"type">> => <<"key_package">>}, <<"1">>, #{})).
 
 member_left_without_channel_id_returns_state_unchanged_test() ->
-    ?assertEqual(#{}, member_left(<<"1">>, #{})).
+    ?assertEqual(#{}, member_left(<<"1">>, <<"c1">>, #{})).
 
 -endif.

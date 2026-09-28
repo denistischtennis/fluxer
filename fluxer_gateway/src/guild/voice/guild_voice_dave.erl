@@ -13,10 +13,10 @@
 
 -export([
     build_driver/1,
-    drive_join/4,
-    negotiate_join/4,
+    drive_join/5,
+    negotiate_join/5,
     drive_message/4,
-    drive_member_left/3,
+    drive_member_left/4,
     drive_timer/3,
     api_call/2,
     method_to_type/1
@@ -63,14 +63,19 @@ build_driver(ChannelId) ->
 %% the updated state. Fan-out targets are computed inside the coordinator from
 %% the live room state (never from a pre-event closure).
 %% --------------------------------------------------------------------------
--spec drive_join(user_id(), non_neg_integer(), channel_id(), voice_dave_coordinator:room_state()) ->
+-spec drive_join(user_id(), non_neg_integer(), binary(), channel_id(), voice_dave_coordinator:room_state()) ->
     {non_neg_integer(), voice_dave_coordinator:room_state()}.
-drive_join(UserId, MaxVersion, ChannelId, RoomState) ->
+drive_join(UserId, MaxVersion, ConnId, ChannelId, RoomState) ->
     %% The channel id must ride along on every downlink event; the client drops
     %% DAVE_PROTOCOL_EVENTs without a usable channel_id, so passing <<>> here
-    %% would silently kill the join handshake.
+    %% would silently kill the join handshake. ConnId is the voice connection
+    %% generation admitted by this negotiation; it lets the coordinator
+    %% distinguish a genuine rejoin from a duplicate token retry and ignore
+    %% stale disconnect notices from superseded connections.
     Driver = build_driver(ChannelId),
-    NewState = voice_dave_host:drive({join, UserId, MaxVersion}, RoomState, Driver),
+    NewState = voice_dave_host:drive(
+        {join, UserId, MaxVersion, to_conn_bin(ConnId)}, RoomState, Driver
+    ),
     {maps:get(version, NewState, 0), NewState}.
 
 %% --------------------------------------------------------------------------
@@ -80,16 +85,16 @@ drive_join(UserId, MaxVersion, ChannelId, RoomState) ->
 %% coordinator, otherwise the connection would silently stay unencrypted.
 %% Returns the negotiated protocol version plus the updated owning state.
 %% --------------------------------------------------------------------------
--spec negotiate_join(user_id(), non_neg_integer(), channel_id(), map()) ->
+-spec negotiate_join(user_id(), non_neg_integer(), binary(), channel_id(), map()) ->
     {ok, non_neg_integer(), map()} | {error, term(), map()}.
-negotiate_join(UserBin, MaxVersion, ChIdBin, State) ->
+negotiate_join(UserBin, MaxVersion, ConnId, ChIdBin, State) ->
     Rooms = maps:get(dave_rooms, State, #{}),
     RS0 =
         case maps:get(ChIdBin, Rooms, undefined) of
             undefined -> voice_dave_coordinator:new_room_state(false, ChIdBin);
             R -> R
         end,
-    try drive_join(UserBin, MaxVersion, ChIdBin, RS0) of
+    try drive_join(UserBin, MaxVersion, ConnId, ChIdBin, RS0) of
         {V, RS1} when is_integer(V) ->
             {ok, V, State#{dave_rooms => Rooms#{ChIdBin => RS1}}};
         Other ->
@@ -119,11 +124,11 @@ drive_message(ChannelId, Raw, SenderUserId, RoomState) ->
             RoomState
     end.
 
--spec drive_member_left(channel_id(), user_id(), voice_dave_coordinator:room_state()) ->
+-spec drive_member_left(channel_id(), user_id(), binary() | undefined, voice_dave_coordinator:room_state()) ->
     voice_dave_coordinator:room_state().
-drive_member_left(ChannelId, UserId, RoomState) ->
+drive_member_left(ChannelId, UserId, ConnId, RoomState) ->
     Driver = build_driver(ChannelId),
-    voice_dave_host:drive({member_left, UserId}, RoomState, Driver).
+    voice_dave_host:drive({member_left, UserId, to_conn_bin(ConnId)}, RoomState, Driver).
 
 -spec drive_timer(channel_id(), term(), voice_dave_coordinator:room_state()) ->
     voice_dave_coordinator:room_state().
@@ -154,6 +159,14 @@ to_int_user(U) when is_integer(U) ->
     {ok, U};
 to_int_user(_) ->
     error.
+%% Normalize a voice connection id to a binary generation tag, or undefined
+%% when the caller has none (legacy paths). Binaries pass through; integers
+%% are stringified.
+-spec to_conn_bin(binary() | integer() | undefined) -> binary() | undefined.
+to_conn_bin(undefined) -> undefined;
+to_conn_bin(C) when is_binary(C) -> C;
+to_conn_bin(C) when is_integer(C) -> integer_to_binary(C).
+
 
 %% --------------------------------------------------------------------------
 %% Synchronous crypto RPC to the API signer. Maps the coordinator's method +
@@ -327,7 +340,7 @@ founding_via_guild_driver_establishes_test() ->
         Driver0 = build_driver(<<"g_ch">>),
         Driver = Driver0#{call_api => CallApi},
         S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
-        S1 = voice_dave_host:drive({join, <<"1001">>, 1}, S0, Driver),
+        S1 = voice_dave_host:drive({join, <<"1001">>, 1, <<"conn-1001">>}, S0, Driver),
         S2 = voice_dave_host:drive({key_package, <<"1001">>, <<"KPA">>}, S1, Driver),
         %% The synchronous validate cascade inside drive/3 founds the room on
         %% the first validated member (seed leaf of their own pending group).
@@ -372,7 +385,7 @@ drive_join_returns_negotiated_version_test() ->
             fun(_) -> {ok, #{<<"sender_package_b64">> => <<"S">>}} end
         ),
         S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
-        {Version, S1} = drive_join(<<"1001">>, 1, <<"42">>, S0),
+        {Version, S1} = drive_join(<<"1001">>, 1, <<"c1001">>, <<"42">>, S0),
         ?assertEqual(1, Version),
         ?assertEqual(1, maps:get(version, S1))
     after

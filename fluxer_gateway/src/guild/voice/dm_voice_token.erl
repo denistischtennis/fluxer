@@ -78,7 +78,7 @@ handle_dm_token_success(Data, Req) ->
         maps:get(<<"serverId">>, Data, undefined)
     ),
     NewState0 = store_and_broadcast(ConnectionId, ChannelId, VoiceState, State),
-    case negotiate_dm_dave(EffE2EE, ChannelId, UserId, Req) of
+    case negotiate_dm_dave(EffE2EE, ChannelId, UserId, ConnectionId, Req) of
         {ok, DaveVersion} ->
             VSUpdate =
                 build_voice_server_update(
@@ -101,16 +101,16 @@ handle_dm_token_success(Data, Req) ->
 
 %% The DM call's MLS room lives in the call gen_server; ask it to admit this
 %% participant and report the negotiated protocol version.
--spec negotiate_dm_dave(boolean(), integer(), integer(), token_request()) ->
+-spec negotiate_dm_dave(boolean(), integer(), integer(), binary() | integer(), token_request()) ->
     {ok, integer() | null} | error.
-negotiate_dm_dave(false, _ChannelId, _UserId, _Req) ->
+negotiate_dm_dave(false, _ChannelId, _UserId, _ConnId, _Req) ->
     {ok, null};
-negotiate_dm_dave(true, ChannelId, UserId, Req) ->
+negotiate_dm_dave(true, ChannelId, UserId, ConnId, Req) ->
     MaxVersion = maps:get(dave_max_version, Req, 0),
     UserBin = integer_to_binary(UserId),
     case call_manager:lookup(ChannelId) of
         {ok, CallPid} ->
-            try gen_server:call(CallPid, {dave_negotiate, UserBin, MaxVersion}, 5000) of
+            try gen_server:call(CallPid, {dave_negotiate, UserBin, MaxVersion, ConnId}, 5000) of
                 {ok, Version} when is_integer(Version) ->
                     {ok, Version};
                 {ok, null} ->
@@ -279,7 +279,7 @@ handle_get_voice_token_ok(Data, UserId, ChannelId, SessionPid, DaveMaxVersion) -
     EffE2EE =
         session_init:dave_capable(DaveMaxVersion) andalso
             guild_voice_e2ee:is_e2ee_enabled_for_dm(),
-    case negotiate_dm_dave(EffE2EE, ChannelId, UserId, #{dave_max_version => DaveMaxVersion}) of
+    case negotiate_dm_dave(EffE2EE, ChannelId, UserId, ConnectionId, #{dave_max_version => DaveMaxVersion}) of
         {ok, DaveVersion} ->
             SessionPid !
                 {voice_server_update, #{

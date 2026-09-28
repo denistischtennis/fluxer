@@ -207,17 +207,14 @@ handle_call_local(get_voice_server_pid, State) ->
     {reply, {ok, self()}, State};
 handle_call_local({set_voice_states, VoiceStates}, State) when is_map(VoiceStates) ->
     {reply, ok, do_set_voice_states(VoiceStates, State)};
-handle_call_local({dave_join, ChIdBin, UserId, MaxVer}, State) ->
-    RoomState = dave_room(ChIdBin, State),
-    {Version, NewRoom} = guild_voice_dave:drive_join(UserId, MaxVer, ChIdBin, RoomState),
-    {reply, {ok, Version}, put_dave_room(ChIdBin, NewRoom, State)};
+%% NOTE: DAVE joins are driven through guild_voice_connection_{join,move}:negotiate_join
+%% at token-issue time, and departures through guild_voice_disconnect_broadcast:
+%% retire_voice_states. There is no direct {dave_join,...} wire path; the former
+%% handler here was vestigial and has been removed in the connection-generation
+%% refactor (it could not carry a connection id anyway).
 handle_call_local({dave_message, ChIdBin, Sender, Raw}, State) ->
     RoomState = dave_room(ChIdBin, State),
     NewRoom = guild_voice_dave:drive_message(ChIdBin, Raw, Sender, RoomState),
-    {reply, ok, put_dave_room(ChIdBin, NewRoom, State)};
-handle_call_local({dave_member_left, ChIdBin, UserBin}, State) ->
-    RoomState = dave_room(ChIdBin, State),
-    NewRoom = guild_voice_dave:drive_member_left(ChIdBin, UserBin, RoomState),
     {reply, ok, put_dave_room(ChIdBin, NewRoom, State)};
 handle_call_local(_, State) ->
     {reply, ok, State}.

@@ -151,8 +151,8 @@ clear_pending_voice_connections_for_channel(ChannelId, State) ->
     guild_state().
 retire_voice_states(Channels, RemovedVoiceStates, RemainingVoiceStates, State) ->
     WithLeft = maps:fold(
-        fun(_ConnId, VoiceState, AccState) ->
-            dave_member_left(VoiceState, AccState)
+        fun(ConnId, VoiceState, AccState) ->
+            dave_member_left(VoiceState, ConnId, AccState)
         end,
         State,
         RemovedVoiceStates
@@ -199,7 +199,7 @@ channel_has_participants(ChannelId, VoiceStates, State) ->
 
 %% Additive to dave_rooms only; guarded so a DAVE error never affects the
 %% disconnect itself.
-dave_member_left(VoiceState, State) ->
+dave_member_left(VoiceState, ConnId, State) ->
     ChId = voice_state_utils:voice_state_channel_id(VoiceState),
     UserId = voice_state_utils:voice_state_user_id(VoiceState),
     case {is_integer(ChId), is_integer(UserId)} of
@@ -211,7 +211,7 @@ dave_member_left(VoiceState, State) ->
                 undefined ->
                     State;
                 RS ->
-                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, RS) of
+                    try guild_voice_dave:drive_member_left(ChIdBin, UserBin, ConnId, RS) of
                         NewRS -> State#{dave_rooms => Rooms#{ChIdBin => NewRS}}
                     catch
                         _:_ ->

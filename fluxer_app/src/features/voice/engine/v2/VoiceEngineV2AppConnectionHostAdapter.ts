@@ -1148,6 +1148,12 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		});
 		this.clearVoiceServerTimeout();
 		this.abortHotSwap();
+		// The MLS session belongs to this connection only. Without tearing it
+		// down here, the stale client stays registered and swallows the next
+		// join's select_protocol_ack (resetting a freshly established group),
+		// while the new client binds blind — the rejoin-corruption class the
+		// channel-move path already guards against below.
+		this.teardownDave();
 		if (room) {
 			room.removeAllListeners();
 			room.disconnect();
@@ -1211,6 +1217,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		this.clearVoiceServerTimeout();
 		this.clearHotSwapTimeout();
 		this.clearHotSwapQueue();
+		this.teardownDave();
 		this.disconnectRoomForTerminalUnload(pendingRoom, 'pending-hot-swap');
 		if (previousRoom && previousRoom !== room && previousRoom !== pendingRoom) {
 			this.disconnectRoomForTerminalUnload(previousRoom, 'previous-hot-swap');
@@ -1328,6 +1335,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 	resetConnectionState(): void {
 		assert.ok(this.connectionSnapshot !== null, 'resetConnectionState pre-condition: snapshot present');
 		this.abortHotSwap();
+		this.teardownDave();
 		this.update(() => {
 			this.isLocalDisconnecting = false;
 			this.transitionConnection({type: 'connection.reset'});
@@ -1345,6 +1353,7 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 		assert.ok(this.connectionSnapshot !== null, 'abortConnection pre-condition: snapshot present');
 		this.clearVoiceServerTimeout();
 		this.abortHotSwap();
+		this.teardownDave();
 		this.update(() => {
 			this.isLocalDisconnecting = false;
 			this.transitionConnection({type: 'connection.abort'});
@@ -1397,6 +1406,17 @@ export class VoiceEngineV2AppConnectionHostAdapter extends Store {
 			return;
 		}
 		try {
+			// Never stack clients: a previous incarnation (from an earlier join
+			// that skipped teardown) would keep its transport wired to the same
+			// channel uplink and race this session's handshake. Destroy it via a
+			// full teardown — but PRESERVE the early-event buffer: this join's
+			// select_protocol_ack / external_sender_package are pushed at
+			// token-issue time and typically land ~1s before the LiveKit connect
+			// resolves and this client exists. Dropping them here would leave the
+			// fresh client un-initialised forever ("Cannot get key ratchet").
+			const pendingEvents = this.earlyDaveEvents;
+			this.teardownDave();
+			this.earlyDaveEvents = pendingEvents;
 			const {DaveModuleFactory} = await import('@fluxer/libdave/wasm');
 			const mod = await DaveModuleFactory();
 			const transport: DaveTransport = {

@@ -120,6 +120,16 @@ ensure_call_update(State, true) ->
 ensure_call_update(State, false) ->
     call_ringing:dispatch_call_update(State).
 
+%% Read the connection generation off a user's voice state (pre-removal), or
+%% undefined when they have none. Passed to member_left so a stale departure
+%% cannot evict a newer rejoin of the same user.
+-spec conn_id_of_user(integer(), map()) -> binary() | integer() | undefined.
+conn_id_of_user(UserId, VoiceStates) ->
+    case maps:get(UserId, VoiceStates, undefined) of
+        undefined -> undefined;
+        VoiceState -> maps:get(<<"connection_id">>, VoiceState, undefined)
+    end.
+
 -spec handle_session_down(pid(), map()) -> {noreply, map()} | {stop, normal, map()}.
 handle_session_down(Pid, #{sessions := Sessions, voice_states := VoiceStates} = State) ->
     case call_state:find_session_by_pid(Pid, Sessions) of
@@ -128,6 +138,7 @@ handle_session_down(Pid, #{sessions := Sessions, voice_states := VoiceStates} = 
             NewVS = maybe_remove_user_voice_state(UserId, NewSess, VoiceStates),
             BaseState = call_dave:member_left(
                 integer_to_binary(UserId),
+                conn_id_of_user(UserId, VoiceStates),
                 State#{voice_states => NewVS, sessions => NewSess}
             ),
             CleanState = call_ringing:cancel_ringing_timers([UserId], BaseState),
@@ -187,6 +198,7 @@ do_disconnect_cleanup(
     ),
     BaseState = call_dave:member_left(
         integer_to_binary(UserId),
+        ConnectionId,
         State#{
             voice_states => NewVS, sessions => NewSess, pending_connections => NewPending
         }
@@ -206,6 +218,7 @@ handle_leave(SessionId, #{sessions := Sessions, voice_states := VoiceStates} = S
             NewVS = maybe_remove_user_voice_state(UserId, NewSess, VoiceStates),
             BaseState = call_dave:member_left(
                 integer_to_binary(UserId),
+                conn_id_of_user(UserId, VoiceStates),
                 State#{voice_states => NewVS, sessions => NewSess}
             ),
             CleanState = call_ringing:cancel_ringing_timers([UserId], BaseState),

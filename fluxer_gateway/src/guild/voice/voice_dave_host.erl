@@ -258,7 +258,7 @@ founding_drives_join_then_sender_package_test() ->
     Ctx = recording_ctx(Rec),
     S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     %% Join triggers select_protocol_ack + a sender_package RPC.
-    S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
+    S1 = apply_event({join, <<"1001">>, 1, <<"conn-1001">>}, S0, Ctx),
     Recorded1 = get_recorded(Rec),
     ?assert(lists:member({send, <<"1001">>, #{type => <<"select_protocol_ack">>, version => 1, target_user_id => <<"1001">>}}, Recorded1)),
     ?assertMatch([{rpc, sender_package, _, {_, <<"1001">>}} | _], [R || R <- Recorded1, element(1, R) =:= rpc]),
@@ -278,7 +278,7 @@ key_package_triggers_create_proposals_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
     S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
-    S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
+    S1 = apply_event({join, <<"1001">>, 1, <<"conn-1001">>}, S0, Ctx),
     S2 = apply_event({key_package, <<"1001">>, <<"KP1">>}, S1, Ctx),
     Recorded1 = get_recorded(Rec),
     ?assert(lists:any(
@@ -294,7 +294,7 @@ key_package_triggers_create_proposals_test() ->
     S3 = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
     %% Founder path: no self-add transition for the first member.
     ?assertEqual(true, maps:get(established, S3)),
-    S4 = apply_event({join, <<"1002">>, 1}, S3, Ctx),
+    S4 = apply_event({join, <<"1002">>, 1, <<"conn-1002">>}, S3, Ctx),
     S5 = apply_event({key_package, <<"1002">>, <<"KP2">>}, S4, Ctx),
     S6 = apply_event({validate_key_package_result, <<"1002">>, #{valid => true}}, S5, Ctx),
     Recorded = get_recorded(Rec),
@@ -317,10 +317,10 @@ proposals_created_broadcasts_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
     S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
-    S1 = apply_event({join, <<"1001">>, 1}, S0, Ctx),
+    S1 = apply_event({join, <<"1001">>, 1, <<"conn-1001">>}, S0, Ctx),
     S2 = apply_event({key_package, <<"1001">>, <<"KP1">>}, S1, Ctx),
     S2b = apply_event({validate_key_package_result, <<"1001">>, #{valid => true}}, S2, Ctx),
-    S3 = apply_event({join, <<"1002">>, 1}, S2b, Ctx),
+    S3 = apply_event({join, <<"1002">>, 1, <<"conn-1002">>}, S2b, Ctx),
     S4 = apply_event({key_package, <<"1002">>, <<"KP2">>}, S3, Ctx),
     S5 = apply_event({validate_key_package_result, <<"1002">>, #{valid => true}}, S4, Ctx),
     S6 = apply_event({proposals_created, <<"PROPS">>}, S5, Ctx),
@@ -332,25 +332,32 @@ proposals_created_broadcasts_test() ->
     ?assertEqual(awaiting_commit, maps:get(phase, T)),
     ok.
 
-%% invalid_commit_welcome from an admitted member tears the group down and
-%% asks everyone to re-init. The internal MLS epoch goes to 0 (a fresh
-%% group is founded there); the wire prepare_epoch value 1 means "brand-new
-%% group" per the DAVE op semantics.
-invalid_resets_epoch_test() ->
+%% invalid_commit_welcome from an admitted member is recovered per RFC 9296:
+%% the flagger's key material is dropped and their stale leaf scheduled for
+%% removal (batched flush timer armed). The room stays established; the other
+%% members are NOT reset.
+invalid_recovers_targeted_test() ->
     Rec = new_recorder(),
     Ctx = recording_ctx(Rec),
     S0 = voice_dave_coordinator:new_room_state(true, <<"42">>),
     S0b = S0#{
         epoch => 3,
         joined => #{<<"1001">> => true, <<"1002">> => true},
-        key_packages => #{<<"1001">> => <<"KP">>, <<"1002">> => <<"KP2">>}
+        key_packages => #{<<"1001">> => <<"KP">>, <<"1002">> => <<"KP2">>},
+        roster => [
+            #{user_id => <<"1001">>, leaf_index => 0},
+            #{user_id => <<"1002">>, leaf_index => 1}
+        ]
     },
     S1 = apply_event({invalid_commit_welcome, <<"1001">>}, S0b, Ctx),
     Recorded = get_recorded(Rec),
-    ?assertEqual(false, maps:get(established, S1)),
-    ?assertEqual(0, maps:get(epoch, S1)),
+    ?assertEqual(true, maps:get(established, S1)),
+    ?assertEqual(3, maps:get(epoch, S1)),
+    ?assertNot(maps:is_key(<<"1001">>, maps:get(key_packages, S1))),
+    ?assertEqual([0], maps:get(pending_removals, S1)),
+    ?assert(lists:any(fun({timer, flush_removals, _}) -> true; (_) -> false end, Recorded)),
     Prepares = [P || {send, _, P} <- Recorded, maps:get(type, P, undefined) =:= <<"prepare_epoch">>],
-    ?assertEqual(2, length(Prepares)),
+    ?assertEqual(0, length(Prepares)),
     ok.
 
 %% member_left with >1 remaining schedules a batched removal timer.
@@ -366,7 +373,7 @@ member_left_schedules_removal_test() ->
             #{user_id => <<"1003">>, leaf_index => 2}
         ]
     },
-    S1 = apply_event({member_left, <<"1002">>}, S0b, Ctx),
+    S1 = apply_event({member_left, <<"1002">>, <<"conn-1002">>}, S0b, Ctx),
     Recorded = get_recorded(Rec),
     ?assert(lists:any(fun({timer, flush_removals, _}) -> true; (_) -> false end, Recorded)),
     ?assertEqual([1], maps:get(pending_removals, S1)),
@@ -384,7 +391,7 @@ sole_member_reset_test() ->
             #{user_id => <<"1002">>, leaf_index => 1}
         ]
     },
-    S1 = apply_event({member_left, <<"1002">>}, S0b, Ctx),
+    S1 = apply_event({member_left, <<"1002">>, <<"conn-1002">>}, S0b, Ctx),
     Recorded = get_recorded(Rec),
     ?assertEqual(false, maps:get(established, S1)),
     Types = [maps:get(type, P, undefined) || {send, <<"1001">>, P} <- Recorded],
@@ -460,7 +467,7 @@ driving_founding_reaches_established_test() ->
     Driver = (recording_ctx(Rec))#{call_api => fun stub_api/2},
     S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
     %% Join cascades: select_protocol_ack + external_sender_package (via RPC).
-    S1 = drive({join, <<"1001">>, 1}, S0, Driver),
+    S1 = drive({join, <<"1001">>, 1, <<"conn-1001">>}, S0, Driver),
     R1 = get_recorded(Rec),
     ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"select_protocol_ack">>}}) -> true; (_) -> false end, R1)),
     ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"external_sender_package">>}}) -> true; (_) -> false end, R1)),
@@ -472,7 +479,7 @@ driving_founding_reaches_established_test() ->
     ?assertEqual(true, maps:get(established, S2v)),
     %% Second member joins -> single-add transition -> proposals relayed to
     %% the founder only.
-    S3 = drive({join, <<"1002">>, 1}, S2v, Driver),
+    S3 = drive({join, <<"1002">>, 1, <<"conn-1002">>}, S2v, Driver),
     S4 = drive({key_package, <<"1002">>, <<"KPB">>}, S3, Driver),
     S5 = drive({validate_key_package_result, <<"1002">>, #{valid => true}}, S4, Driver),
     R5 = get_recorded(Rec),
@@ -493,7 +500,7 @@ drive_api_error_halts_test() ->
     FailApi = fun(sender_package, _) -> {error, down}; (_, _) -> {ok, #{}} end,
     Driver = (recording_ctx(Rec))#{call_api => FailApi},
     S0 = voice_dave_coordinator:new_room_state(false, <<"42">>),
-    _S1 = drive({join, <<"1001">>, 1}, S0, Driver),
+    _S1 = drive({join, <<"1001">>, 1, <<"conn-1001">>}, S0, Driver),
     %% ack still sent, but no external_sender_package (RPC failed).
     R1 = get_recorded(Rec),
     ?assert(lists:any(fun({send, <<"1001">>, #{type := <<"select_protocol_ack">>}}) -> true; (_) -> false end, R1)),

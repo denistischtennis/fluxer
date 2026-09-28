@@ -175,6 +175,12 @@ export class DaveClient {
 		if (this.latestPreparedTransitionVersion === this.disabledVersion()) {
 			return null;
 		}
+		// Before the group is established there is no ratchet to hand out;
+		// pulling one from WASM anyway logs "Cannot get key ratchet" on every
+		// event. Guard here so the worker simply sees "no key yet".
+		if (!this.established) {
+			return null;
+		}
 		return ratchetFromWasm(this.session.GetKeyRatchet(userId));
 	}
 
@@ -261,12 +267,24 @@ export class DaveClient {
 				{channelId: this.channelId},
 			);
 		}
-		this.session.SetExternalSender(bytes);
-		this.externalSenderB64 = dataB64;
-		this.externalSenderSet = true;
-		if (this.pendingKeyPackage || this.established) {
-			// Fresh DS package: (re-)upload our KP so future joins can add us.
-			this.sendKeyPackage();
+		// libdave throws 'Cannot set external sender after joining/creating an
+		// MLS group' once currentState_ exists, and that throw routes through the
+		// MLS-failure callback which would poison the session (status 'broken').
+		// The DS sender is deployment-wide and unchanged for this group's
+		// lifetime; when already established just cache the bytes for the next
+		// re-init and skip both the install and the (impossible) KP re-upload —
+		// a committed session has consumed its join key package, and re-adding
+		// always flows through a fresh generation driven by prepare_epoch.
+		if (!this.established) {
+			this.session.SetExternalSender(bytes);
+			this.externalSenderB64 = dataB64;
+			this.externalSenderSet = true;
+			if (this.pendingKeyPackage) {
+				// Deferred founding upload: the sender is now installed.
+				this.sendKeyPackage();
+			}
+		} else {
+			this.externalSenderB64 = dataB64;
 		}
 	}
 
@@ -319,8 +337,13 @@ export class DaveClient {
 			this.prepareDaveProtocolRatchets(transitionId, this.session.GetProtocolVersion());
 			this.maybeSendReadyForTransition(transitionId);
 		} else {
+			// RFC 9296: a member that cannot apply the winning commit reports
+			// it and supplies a fresh key package; the delivery service removes
+			// the stale representation and re-adds this client. Re-initialising
+			// locally as well would race the gateway's own recovery cascade and
+			// amplify resets across the room.
 			this.flagInvalidCommitWelcome(transitionId);
-			this.handleDaveProtocolInit(this.session.GetProtocolVersion());
+			this.sendKeyPackage();
 		}
 	}
 
@@ -380,6 +403,15 @@ export class DaveClient {
 			this.session.Init(protocolVersion, BigInt(this.channelId), this.selfUserId, privateKey);
 			this.externalSenderSet = false;
 			this.pendingKeyPackage = false;
+			// A brand-new group generation invalidates everything tied to the
+			// previous one: establishment, a held proposals bundle (its epoch
+			// binding is now stale), and a transient MLS failure that the
+			// gateway is explicitly recovering from. TOFU-broken stays sticky:
+			// a trust-anchor change is never healed by a reset.
+			this.established = false;
+			this.mlsFailed = false;
+			this.deferredProposalsB64 = null;
+			this.deferredProposalReason = '';
 			this.lastProcessedProposalsB64 = null;
 			if (this.externalSenderB64 !== null) {
 				// Re-arm the deferred-key-package path: the DS sender is

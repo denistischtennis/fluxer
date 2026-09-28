@@ -242,3 +242,154 @@ test('duplicate deliveries of the same proposals bundle are processed once', asy
 	a.destroy();
 	b.destroy();
 });
+
+
+// --- regression tests: rejoin / reset-flag hygiene -----------------------
+
+function makeClient(userId: string, transport: RecordingTransport): DaveClient {
+	return new DaveClient({mod, selfUserId: userId, channelId: GROUP, transport, tofu: new TofuStore(new MemStorage())});
+}
+
+interface EstablishedFixture {
+	delivery: InstanceType<DaveNodeModule['DaveDelivery']>;
+	senderB64: string;
+	a: DaveClient;
+	b: DaveClient;
+	ta: RecordingTransport;
+	tb: RecordingTransport;
+}
+
+function driveToEstablished(seed: number): EstablishedFixture {
+	const delivery = new mod.DaveDelivery();
+	const gen = delivery.GenerateExternalSender(Array.from({length: 32}, (_, i) => (i * seed + 5) & 0xff));
+	const senderB64 = b64(gen.senderPackage as number[]);
+	const ta = new RecordingTransport();
+	const tb = new RecordingTransport();
+	const a = makeClient(USER_A, ta);
+	const b = makeClient(USER_B, tb);
+	a.onEvent({type: 'select_protocol_ack', version: 1});
+	b.onEvent({type: 'select_protocol_ack', version: 1});
+	a.onEvent({type: 'external_sender_package', data: senderB64});
+	b.onEvent({type: 'external_sender_package', data: senderB64});
+	a.recognizeUser(USER_B);
+	b.recognizeUser(USER_A);
+	const kpB = tb.last('key_package')!.data as string;
+	const proposals = delivery.CreateProposals(GROUP, 0, [unb64(kpB)], []);
+	a.onEvent({type: 'proposals', data: b64(proposals as number[])});
+	const parsed = delivery.ParseCommitWelcome(GROUP, 0, USER_A, unb64(ta.last('commit_welcome')!.data as string), proposals, []);
+	a.onEvent({type: 'announce_commit_transition', transition_id: 1, data: b64(parsed.commit as number[])});
+	b.onEvent({type: 'welcome', transition_id: 1, data: b64(parsed.welcome as number[])});
+	return {delivery, senderB64, a, b, ta, tb};
+}
+
+test('established flag is cleared when a new group generation is prepared', () => {
+	const f = driveToEstablished(11);
+	expect(f.a.status).toBe('established');
+	// A bare prepare_epoch(1) (coordinator re-found / single-member reset) must
+	// drop establishment so the client re-handshakes instead of lying.
+	f.a.onEvent({type: 'prepare_epoch', epoch: 1, version: 1});
+	expect(f.a.status).not.toBe('established');
+	expect(f.a.status).toBe('handshaking');
+	// The fresh generation re-uploads a key package immediately (sender cached).
+	expect(f.ta.sent.filter((m) => m.type === 'key_package').length).toBeGreaterThan(1);
+	f.a.destroy();
+	f.b.destroy();
+});
+
+test('a deferred proposals bundle is dropped when a new group is prepared', () => {
+	const delivery = new mod.DaveDelivery();
+	const gen = delivery.GenerateExternalSender(Array.from({length: 32}, (_, i) => (i * 3 + 1) & 0xff));
+	const senderB64 = b64(gen.senderPackage as number[]);
+	const tb = new RecordingTransport();
+	const b = makeClient(USER_B, tb);
+	b.onEvent({type: 'select_protocol_ack', version: 1});
+	b.onEvent({type: 'external_sender_package', data: senderB64});
+	const bundle = b64(delivery.CreateProposals(GROUP, 0, [unb64(tb.last('key_package')!.data as string)], []) as number[]);
+
+	const ta = new RecordingTransport();
+	const a = makeClient(USER_A, ta);
+	a.onEvent({type: 'select_protocol_ack', version: 1});
+	a.onEvent({type: 'external_sender_package', data: senderB64});
+	// Defer the bundle (B not recognized yet).
+	a.onEvent({type: 'proposals', data: bundle});
+	expect(ta.last('commit_welcome')).toBeUndefined();
+	// A new group generation invalidates the held bundle; recognition must NOT
+	// resurrect it (its epoch binding belongs to the discarded group).
+	a.onEvent({type: 'prepare_epoch', epoch: 1, version: 1});
+	a.recognizeUser(USER_B);
+	expect(ta.last('commit_welcome')).toBeUndefined();
+	a.destroy();
+	b.destroy();
+});
+
+test('getRatchet returns null before the group is established (no WASM log spam)', () => {
+	const t = new RecordingTransport();
+	const a = makeClient(USER_A, t);
+	a.onEvent({type: 'select_protocol_ack', version: 1});
+	a.onEvent({type: 'external_sender_package', data: b64(new mod.DaveDelivery().GenerateExternalSender(Array.from({length: 32}, (_, i) => i & 0xff)).senderPackage as number[])});
+	// Not established yet: no ratchet available, and crucially we never call
+	// into Session.GetKeyRatchet (which would log "Cannot get key ratchet").
+	expect(a.getRatchet(USER_A)).toBeNull();
+	expect(a.getRatchet(USER_B)).toBeNull();
+	a.destroy();
+});
+
+test('external_sender_package arriving after establishment does not poison the session', () => {
+	const f = driveToEstablished(17);
+	expect(f.a.status).toBe('established');
+	const before = f.ta.sent.length;
+	// Coordinator re-sends the SAME DS package (e.g. another member rejoined).
+	// Established session must NOT call SetExternalSender (WASM throws post-join
+	// -> failure callback -> mlsFailed) and must stay usable.
+	f.a.onEvent({type: 'external_sender_package', data: f.senderB64});
+	expect(f.a.status).toBe('established');
+	expect(f.a.getTofuStatus()).toBe('pinned');
+	// No doomed KP re-upload attempt; the current session simply caches the
+	// sender for the next generation and stays usable.
+	expect(f.ta.sent.length).toBe(before);
+	expect(f.a.getRatchet(USER_A)).not.toBeNull();
+	f.a.destroy();
+	f.b.destroy();
+});
+
+test('invalid commit recovery reports the flag and re-uploads a key package', () => {
+	const f = driveToEstablished(19);
+	const before = f.ta.sent.length;
+	// Garbage commit -> ProcessCommit fails -> report invalid + fresh KP.
+	f.a.onEvent({type: 'announce_commit_transition', transition_id: 7, data: b64([0x00, 0x01, 0x02])});
+	expect(f.ta.last('invalid_commit_welcome')).toBeTruthy();
+	expect(f.ta.last('key_package')).toBeTruthy();
+	// The hard MLS failure marks the session broken (fail-closed) until the
+	// coordinator recovers it with a fresh prepare_epoch.
+	expect(f.a.status).toBe('broken');
+	// Recovery: prepare_epoch clears the failure and starts a clean handshake.
+	f.a.onEvent({type: 'prepare_epoch', epoch: 1, version: 1});
+	expect(f.a.status).toBe('handshaking');
+	// Only the two uplink messages were added at the failure point; no extra
+	// init chatter from a self-triggered reset storm.
+	expect(f.ta.sent[before].type).toBe('invalid_commit_welcome');
+	expect(f.ta.sent[before + 1].type).toBe('key_package');
+	f.a.destroy();
+	f.b.destroy();
+});
+
+// Simulates the adapter's early-event-buffer replay: a fresh client receives
+// [select_protocol_ack, external_sender_package] in one burst AFTER the LiveKit
+// connect resolved (the gateway pushed them at token-issue time). The client must
+// converge to an uploaded key package exactly as if they arrived live.
+test('replayed ack+sender burst on a fresh client uploads its key package', () => {
+	const delivery = new mod.DaveDelivery();
+	const gen = delivery.GenerateExternalSender(Array.from({length: 32}, (_, i) => (i * 23 + 7) & 0xff));
+	const senderB64 = b64(gen.senderPackage as number[]);
+	const t = new RecordingTransport();
+	const a = makeClient(USER_A, t);
+	// Burst replay order mirrors the downlink stream: ack first, then DS package.
+	a.onEvent({type: 'select_protocol_ack', version: 1});
+	a.onEvent({type: 'external_sender_package', data: senderB64});
+	const kp = t.last('key_package');
+	expect(kp).toBeTruthy();
+	expect((kp!.data ?? '').length).toBeGreaterThan(200);
+	expect(a.status).toBe('handshaking');
+	expect(a.getTofuStatus()).toBe('pinned');
+	a.destroy();
+});

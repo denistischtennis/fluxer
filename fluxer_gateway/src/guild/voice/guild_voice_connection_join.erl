@@ -213,6 +213,7 @@ build_new_voice_state(Build) ->
                 guild_voice_dave:negotiate_join(
                     integer_to_binary(maps:get(user_id, Context)),
                     maps:get(dave_max_version, Context, 1),
+                    ConnectionId,
                     guild_voice_connection_util:snowflake_bin(ChannelIdValue),
                     State2
                 );
