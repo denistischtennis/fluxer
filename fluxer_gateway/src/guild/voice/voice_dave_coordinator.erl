@@ -481,30 +481,49 @@ handle({validate_key_package_result, UserId, #{valid := false, reason := Reason}
 
 %% Gate: only one MLS transition may be live at a time. Extra targets wait in
 %% `add_queue' (arrival order, deduplicated) and are released one per completed
-%% transition by drain_next_add/2.
+%% transition by drain_next_add/2. Targets that are already roster members are
+%% dropped: a duplicate key-package validation for an existing member must not
+%% produce a second Add (libdave rejects it as 'Duplicate encryption key').
 -spec maybe_start_add(room_state(), [user_id()]) -> {room_state(), [action()]}.
-maybe_start_add(State, Targets) ->
-    case maps:get(transition, State, undefined) of
-        undefined ->
-            start_add_transition(State, Targets);
-        _Active ->
-            Queue0 = maps:get(add_queue, State, []),
-            Queue1 = Queue0 ++ [U || U <- Targets, not lists:member(U, Queue0)],
-            {State#{add_queue => Queue1}, []}
+maybe_start_add(State0, Targets0) ->
+    Targets = Targets0 -- roster_users(State0),
+    case Targets of
+        [] ->
+            {State0, []};
+        _ ->
+            case maps:get(transition, State0, undefined) of
+                undefined ->
+                    start_add_transition(State0, Targets);
+                _Active ->
+                    Queue0 = maps:get(add_queue, State0, []),
+                    Queue1 = Queue0 ++ [U || U <- Targets, not lists:member(U, Queue0)],
+                    {State0#{add_queue => Queue1}, []}
+            end
     end.
 
 %% Release exactly one queued add (the caller just freed the transition slot).
 %% Releasing more than one eagerly would sign overlapping proposals for the same
 %% epoch before the previous transition's welcome has been delivered.
+%% Entries that became members while queued (duplicate validations racing the
+%% active transition) are stale and get discarded here.
 -spec drain_next_add(room_state(), [action()]) -> {room_state(), [action()]}.
 drain_next_add(State, Actions) ->
     case maps:get(add_queue, State, []) of
         [] ->
             {State, Actions};
         [Next | Rest] ->
-            {S1, A1} = start_add_transition(State#{add_queue => Rest}, [Next]),
-            {S1, Actions ++ A1}
+            case lists:member(Next, roster_users(State)) of
+                true ->
+                    drain_next_add(State#{add_queue => Rest}, Actions);
+                false ->
+                    {S1, A1} = start_add_transition(State#{add_queue => Rest}, [Next]),
+                    {S1, Actions ++ A1}
+            end
     end.
+
+-spec roster_users(room_state()) -> [user_id()].
+roster_users(State) ->
+    [U || #{user_id := U} <- maps:get(roster, State, [])].
 
 -spec start_add_transition(room_state(), [user_id()]) -> {room_state(), [action()]}.
 start_add_transition(State, TargetUsers) ->
@@ -967,5 +986,64 @@ established_three_users() ->
         key_packages => maps:put(<<"1003">>, <<"KPC">>, maps:get(key_packages, S)),
         roster => maps:get(roster, S) ++ [#{user_id => <<"1003">>, leaf_index => 2}]
     }.
+
+%% A duplicate key-package validation racing an active add transition queued
+%% the same user twice; once the first transition lands them in the roster the
+%% stale queue head must be dropped instead of producing a second Add
+%% (libdave: 'Duplicate encryption key').
+stale_queued_add_skipped_when_already_member_test() ->
+    S0 = (new_room_state(false, <<"42">>))#{
+        version => 1,
+        established => true,
+        epoch => 0,
+        joined => #{<<"1001">> => true, <<"1002">> => true},
+        key_packages => #{<<"1001">> => <<"KPA">>, <<"1002">> => <<"KPB">>},
+        roster => [#{user_id => <<"1001">>, leaf_index => 0}],
+        add_queue => [<<"1002">>],
+        transition => #{
+            id => 2,
+            phase => awaiting_commit,
+            ready_set => #{},
+            target_users => [<<"1002">>],
+            deadline_ms => 10000,
+            initiated_by => undefined
+        }
+    },
+    Parsed = #{
+        new_epoch => 1,
+        roster => [
+            #{user_id => <<"1001">>, leaf_index => 0},
+            #{user_id => <<"1002">>, leaf_index => 1}
+        ],
+        welcome_b64 => <<"W">>,
+        commit_b64 => <<"C">>
+    },
+    {S2, A2} = handle({commit_parsed, ok, Parsed}, S0),
+    ?assertEqual([], maps:get(add_queue, S2)),
+    ?assertEqual(undefined, maps:get(transition, S2, undefined)),
+    ?assertNot(has_rpc(A2, create_proposals)).
+
+%% A late re-validation of a key package for a user who is already a member
+%% must not start or queue any add either.
+revalidation_of_existing_member_does_not_readd_test() ->
+    S0 = (new_room_state(false, <<"42">>))#{
+        version => 1,
+        established => true,
+        epoch => 1,
+        joined => #{<<"1001">> => true, <<"1002">> => true},
+        roster => [
+            #{user_id => <<"1001">>, leaf_index => 0},
+            #{user_id => <<"1002">>, leaf_index => 1}
+        ],
+        key_packages => #{<<"1001">> => <<"KPA">>},
+        pending_kps => #{<<"1002">> => <<"KPB2">>},
+        transition => undefined
+    },
+    {S1, A1} = handle({validate_key_package_result, <<"1002">>, #{valid => true}}, S0),
+    %% The KP promotion still happens (cache refresh) but no add fires.
+    ?assertEqual(<<"KPB2">>, maps:get(<<"1002">>, maps:get(key_packages, S1))),
+    ?assertEqual([], maps:get(add_queue, S1)),
+    ?assertEqual(undefined, maps:get(transition, S1, undefined)),
+    ?assertNot(has_rpc(A1, create_proposals)).
 
 -endif.
