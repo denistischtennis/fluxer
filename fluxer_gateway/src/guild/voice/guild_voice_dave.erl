@@ -159,6 +159,7 @@ to_int_user(U) when is_integer(U) ->
     {ok, U};
 to_int_user(_) ->
     error.
+
 %% Normalize a voice connection id to a binary generation tag, or undefined
 %% when the caller has none (legacy paths). Binaries pass through; integers
 %% are stringified.

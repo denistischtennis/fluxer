@@ -114,58 +114,104 @@ export class DaveSendCryptor {
  * per-sender, not per-track).
  */
 export class DaveReceiveCryptor {
-	private readonly decryptor: InstanceType<DaveModule['Decryptor']>;
+	// Most-recent ratchet's decryptor first. A rejoin re-adds the same user at a
+	// fresh generation-0 key; libdave's Decryptor ignores a second
+	// TransitionToKeyRatchet whose key domain is already installed ("Ignoring key
+	// ratchet for already installed key domain"), which would strand the receiver
+	// on a stale key and reject every subsequent frame. Installing each distinct
+	// ratchet on its OWN fresh Decryptor sidesteps that guard, while keeping the
+	// previous decryptor(s) for the transition overlap window so in-flight frames
+	// encrypted under the outgoing key still decrypt. GCM authentication means a
+	// wrong-key attempt simply fails over to the next candidate — never wrong audio.
+	private readonly decryptors: InstanceType<DaveModule['Decryptor']>[] = [];
+	private installedKey: string | null = null;
 	private passthrough = false;
 
-	constructor(private readonly mod: DaveModule) {
-		this.decryptor = new mod.Decryptor();
-	}
+	constructor(private readonly mod: DaveModule) {}
 
 	public transitionTo(ratchet: DaveKeyRatchet): void {
-		this.decryptor.TransitionToKeyRatchet(ratchet as unknown as never);
+		const key = ratchet.baseSecret.join(',');
+		if (key === this.installedKey) {
+			return;
+		}
+		const decryptor = new this.mod.Decryptor();
+		decryptor.TransitionToKeyRatchet(ratchet as unknown as never);
+		if (this.passthrough) {
+			decryptor.TransitionToPassthroughMode(true);
+		}
+		this.decryptors.unshift(decryptor);
+		// Bound the stack: keep the current key plus a couple of prior ones for
+		// the overlap window; dispose anything older.
+		while (this.decryptors.length > 3) {
+			const stale = this.decryptors.pop();
+			try {
+				stale?.dispose();
+			} catch {
+				/* already released */
+			}
+		}
+		this.installedKey = key;
 	}
 
 	public setPassthrough(enabled: boolean): void {
 		this.passthrough = enabled;
-		this.decryptor.TransitionToPassthroughMode(enabled);
+		for (const decryptor of this.decryptors) {
+			decryptor.TransitionToPassthroughMode(enabled);
+		}
 	}
 
 	/**
-	 * Decrypt a received ciphertext frame. On failure, returns the original bytes
+	 * Decrypt a received ciphertext frame, trying the most recent ratchet first
+	 * and falling back through prior ones. On failure, returns the original bytes
 	 * when passthrough is active, otherwise an empty failed result so the caller
 	 * drops the frame.
 	 */
 	public decrypt(mediaType: number, ciphertext: Uint8Array): DecryptedFrame {
-		const maxCap = this.decryptor.GetMaxPlaintextByteSize(
-			(mediaType === MEDIA_TYPE_VIDEO ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_AUDIO) as never,
-			ciphertext.length,
-		);
+		const type = (mediaType === MEDIA_TYPE_VIDEO ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_AUDIO) as never;
+		let maxCap = 0;
+		for (const decryptor of this.decryptors) {
+			maxCap = Math.max(
+				maxCap,
+				decryptor.GetMaxPlaintextByteSize(type, ciphertext.length),
+			);
+		}
+		if (maxCap === 0) {
+			return this.passthrough
+				? {bytes: ciphertext, ok: true}
+				: {bytes: new Uint8Array(), ok: false};
+		}
 		const ptr = this.mod._malloc(maxCap);
 		try {
-			this.mod.HEAPU8.set(ciphertext, ptr);
-			const written = this.decryptor.Decrypt(
-				(mediaType === MEDIA_TYPE_VIDEO ? MEDIA_TYPE_VIDEO : MEDIA_TYPE_AUDIO) as never,
-				ptr,
-				ciphertext.length,
-				maxCap,
-			);
-			if (written === 0) {
-				if (this.passthrough) {
-					return {bytes: ciphertext, ok: true};
+			for (const decryptor of this.decryptors) {
+				this.mod.HEAPU8.set(ciphertext, ptr);
+				const written = decryptor.Decrypt(
+					type,
+					ptr,
+					ciphertext.length,
+					maxCap,
+				);
+				if (written !== 0) {
+					return {bytes: toU8(this.mod.HEAPU8.slice(ptr, ptr + written)), ok: true};
 				}
-				return {bytes: new Uint8Array(), ok: false};
 			}
-			return {bytes: toU8(this.mod.HEAPU8.slice(ptr, ptr + written)), ok: true};
+			if (this.passthrough) {
+				return {bytes: ciphertext, ok: true};
+			}
+			return {bytes: new Uint8Array(), ok: false};
 		} finally {
 			this.mod._free(ptr);
 		}
 	}
 
 	public dispose(): void {
-		try {
-			this.decryptor.delete();
-		} catch {
-			/* already deleted */
+		for (const decryptor of this.decryptors) {
+			try {
+				decryptor.dispose();
+			} catch {
+				/* already deleted */
+			}
 		}
+		this.decryptors.length = 0;
+		this.installedKey = null;
 	}
 }

@@ -111,3 +111,71 @@ describe('DaveFrameCryptor receive failure handling', () => {
 		recv.dispose();
 	});
 });
+
+describe('DaveReceiveCryptor ratchet re-transition (rejoin churn)', () => {
+	// Regression: on a rejoin the same sender identity can be handed two distinct
+	// generation-0 keys in quick succession (an intermediate then the final).
+	// libdave's Decryptor silently ignores a second TransitionToKeyRatchet whose
+	// key domain is already installed, which stranded the receiver on the first
+	// key and rejected every subsequent frame ("cannot process nonce" / "Failed
+	// to finalize decryption"). Each distinct ratchet must install on its own
+	// fresh Decryptor so the latest key is always live, while prior keys stay
+	// available for the transition overlap window.
+	test('a second distinct ratchet installs and decrypts; prior key retained', () => {
+		const SSRC = 0x1234abcd;
+		const r1 = {cipherSuite: 2, baseSecret: Array.from({length: 16}, (_, i) => (i * 7 + 1) & 0xff)};
+		const r2 = {cipherSuite: 2, baseSecret: Array.from({length: 16}, (_, i) => (i * 13 + 99) & 0xff)};
+		expect(r1.baseSecret.join(',')).not.toBe(r2.baseSecret.join(','));
+
+		const send1 = new DaveSendCryptor(mod);
+		send1.setRatchet(r1 as never);
+		send1.assignSsrc(SSRC, DAVE_CODEC.Opus);
+		const send2 = new DaveSendCryptor(mod);
+		send2.setRatchet(r2 as never);
+		send2.assignSsrc(SSRC, DAVE_CODEC.Opus);
+
+		const recv = new DaveReceiveCryptor(mod);
+		recv.transitionTo(r1 as never); // intermediate key
+		recv.transitionTo(r2 as never); // final key (previously ignored here)
+
+		// Latest-key frame decrypts (the case that broke in production).
+		const enc2 = send2.encrypt(MEDIA_TYPE_AUDIO, Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]));
+		const dec2 = recv.decrypt(MEDIA_TYPE_AUDIO, enc2.bytes);
+		expect(dec2.ok).toBe(true);
+		expect(Array.from(dec2.bytes)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+
+		// Prior-key frame still decrypts via the retained overlap decryptor.
+		const enc1 = send1.encrypt(MEDIA_TYPE_AUDIO, Uint8Array.from([9, 8, 7, 6, 5, 4, 3, 2]));
+		const dec1 = recv.decrypt(MEDIA_TYPE_AUDIO, enc1.bytes);
+		expect(dec1.ok).toBe(true);
+		expect(Array.from(dec1.bytes)).toEqual([9, 8, 7, 6, 5, 4, 3, 2]);
+
+		// A frame under neither installed key must NOT falsely decrypt.
+		const send3 = new DaveSendCryptor(mod);
+		send3.setRatchet({cipherSuite: 2, baseSecret: Array.from({length: 16}, (_, i) => (i * 3 + 5) & 0xff)} as never);
+		send3.assignSsrc(SSRC, DAVE_CODEC.Opus);
+		const enc3 = send3.encrypt(MEDIA_TYPE_AUDIO, Uint8Array.from([1, 1, 1, 1, 1, 1, 1, 1]));
+		expect(recv.decrypt(MEDIA_TYPE_AUDIO, enc3.bytes).ok).toBe(false);
+
+		send1.dispose();
+		send2.dispose();
+		send3.dispose();
+		recv.dispose();
+	});
+
+	test('re-applying the same ratchet is a no-op (no decryptor churn)', () => {
+		const r = {cipherSuite: 2, baseSecret: Array.from({length: 16}, (_, i) => (i * 5 + 3) & 0xff)};
+		const send = new DaveSendCryptor(mod);
+		send.setRatchet(r as never);
+		send.assignSsrc(0x1111, DAVE_CODEC.Opus);
+		const recv = new DaveReceiveCryptor(mod);
+		recv.transitionTo(r as never);
+		recv.transitionTo(r as never); // identical key -> ignored internally
+		const enc = send.encrypt(MEDIA_TYPE_AUDIO, Uint8Array.from([4, 5, 6, 7, 8, 9, 10, 11]));
+		const dec = recv.decrypt(MEDIA_TYPE_AUDIO, enc.bytes);
+		expect(dec.ok).toBe(true);
+		expect(Array.from(dec.bytes)).toEqual([4, 5, 6, 7, 8, 9, 10, 11]);
+		send.dispose();
+		recv.dispose();
+	});
+});
