@@ -1,0 +1,15 @@
+# LAN TLS reverse proxy for DAVE live testing (commit copy of the running config).
+# Deployed at /tmp/fluxer-caddy/Caddyfile inside container `dave-tls` (caddy:2),
+# joined to network fluxer-dev_default, published as 0.0.0.0:443 (tcp+udp).
+# Upstream is the fluxer-dev `proxy` service listening on workspace:8088, which
+# multiplexes app assets, gateway WebSocket and /livekit — Caddy only needs the
+# single upstream.
+
+{
+	admin off
+}
+
+:443 {
+	tls /certs/tls.crt /certs/tls.key
+	reverse_proxy workspace:8088
+}
